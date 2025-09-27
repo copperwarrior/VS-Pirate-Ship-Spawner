@@ -15,15 +15,15 @@ try { VSGameUtils = Java.loadClass('org.valkyrienskies.mod.common.VSGameUtilsKt'
 // persistent maps/flags (Rhino-safe)
 var SHIPS_TRACK = SHIPS_TRACK || {}; // shipId -> state
 var BARREL_TRACK = BARREL_TRACK || {}; // barrelId -> { ship, level, pos, createTime }
-var TRACK_DBG   = (typeof TRACK_DBG === 'boolean') ? TRACK_DBG : true; // default: on
+// TRACK_DBG now managed via global.TRACK_DBG (set by commands)
 
 function logDetail(msg){
-  if (!TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
+  if (!global.TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
   try { console.log('[Ships/TrackDBG] ' + msg); } catch(_){ }
 }
 
 function logTrack(msg){
-  if (!TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
+  if (!global.TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
   try { console.log('[Ships/TrackDBG] '+msg); } catch(_){ }
 }
 
@@ -35,7 +35,7 @@ var TRACK_CFG = TRACK_CFG || {
 
 // ---------- tiny utils ----------
 function tell(server, text) { try { server.tell(text); } catch(e){} }
-function dbg(server, msg)   { if (!TRACK_DBG) return; tell(server, Text.gray('[Ships/Track] ' + msg)); }
+function dbg(server, msg)   { if (!global.TRACK_DBG) return; tell(server, Text.gray('[Ships/Track] ' + msg)); }
 function err(server, msg)   { tell(server, Text.red('[Ships/Track] ' + msg)); }
 
 // KubeJS server scheduler helper
@@ -453,17 +453,7 @@ function _initDecay(st) {
   // Initialize first layer
   _generateShuffledLayer(st);
   
-  // Debug ship positioning
-  try {
-    var transform = st.ship.getTransform();
-    var shipSpacePos = transform.positionInShip;
-    var worldPos = transform.positionInWorld;
-    logTrack('initDecay ship='+st.id+' actual bounds='+st.decayBounds.minX+','+st.decayBounds.minY+','+st.decayBounds.minZ+' to '+st.decayBounds.maxX+','+st.decayBounds.maxY+','+st.decayBounds.maxZ);
-    logTrack('initDecay ship='+st.id+' shipSpacePos='+shipSpacePos.x+','+shipSpacePos.y+','+shipSpacePos.z+' worldPos='+worldPos.x+','+worldPos.y+','+worldPos.z);
-    logTrack('initDecay ship='+st.id+' starting at actual bottom Y='+st.decayCurrentY+' (found by scanning)');
-  } catch(e) {
-    logTrack('initDecay ship='+st.id+' debug error: '+e);
-  }
+  // Debug ship positioning removed for performance
   
   var server = st.level ? st.level.server : null;
   if (server) {
@@ -473,14 +463,11 @@ function _initDecay(st) {
 
 function _processSailDecay(st) {
   if (!st || !st.ship || !st.level || !st.sailDecayActive) {
-    logDetail('processSailDecay early exit: st='+!!st+' ship='+!!st?.ship+' level='+!!st?.level+' active='+!!st?.sailDecayActive);
     return;
   }
   
   var currentTick = global.Ships_tickCounter();
   var sailDecayInterval = 20; // 1 second (20 ticks)
-  
-  logDetail('processSailDecay ship='+st.id+' tick='+currentTick+' lastTime='+st.sailDecayLastTime+' interval='+sailDecayInterval);
   
   // Check if enough time has passed since last sail decay
   if (currentTick - st.sailDecayLastTime < sailDecayInterval) {
@@ -494,8 +481,6 @@ function _processSailDecay(st) {
   var sailBlocks = [];
   var totalBlocksChecked = 0;
   var sailBlocksFound = 0;
-  
-  logDetail('processSailDecay ship='+st.id+' searching bounds Y='+bounds.minY+' to '+bounds.maxY+' X='+bounds.minX+' to '+bounds.maxX+' Z='+bounds.minZ+' to '+bounds.maxZ);
   
   // Search from top to bottom for sail blocks
   for (var y = bounds.maxY; y >= bounds.minY && sailBlocks.length === 0; y--) {
@@ -512,7 +497,6 @@ function _processSailDecay(st) {
         var isSail = _isSailBlock(blockState);
         if (isSail) {
           sailBlocksFound++;
-          logDetail('processSailDecay ship='+st.id+' found sail block at ('+randomX+','+y+','+randomZ+'): '+blockState.getBlock());
         }
         
         if (isSail) {
@@ -523,8 +507,6 @@ function _processSailDecay(st) {
     }
   }
   
-  logDetail('processSailDecay ship='+st.id+' checked '+totalBlocksChecked+' blocks, found '+sailBlocksFound+' sail blocks, selected '+sailBlocks.length+' for processing');
-  
   if (sailBlocks.length > 0) {
     var startPos = sailBlocks[0];
     var CFG = global.Ships_CFG;
@@ -533,7 +515,6 @@ function _processSailDecay(st) {
     
     if (sailsRemoved > 0) {
       st.sailDecayLastTime = currentTick;
-      logDetail('processSailDecay ship='+st.id+' removed '+sailsRemoved+' sail blocks via floodfill');
       
       // Play sack break sound for sail decay
       _playSailBreakSound(st, startPos.x, startPos.y, startPos.z);
@@ -630,29 +611,20 @@ function _playSailBreakSound(st, chunkX, chunkY, chunkZ) {
 }
 
 function _isSailBlock(blockState) {
-  try {
     var block = blockState.getBlock();
     var blockId = block.getId();
     
     // Debug: Log every block we check for now to see what's available
-    if (blockId.includes('sail')) {
-      logDetail('isSailBlock checking potential sail: '+blockId);
-    }
+    // Checking for sail blocks
     
     // Method 0: THE CORRECT WAY - Check ITEM tag, not block tag!
     // Based on the VS_Sails code: state.getBlock().asItem().getDefaultInstance().is(tag)
-    try {
+    
       if (typeof block.asItem === 'function') {
         var item = block.asItem();
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' got item from block: '+item);
-        }
         
         if (typeof item.getDefaultInstance === 'function') {
           var itemStack = item.getDefaultInstance();
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' got itemStack: '+itemStack);
-          }
           
           // Try KubeJS hasTag method first (recommended approach)
           if (typeof itemStack.hasTag === 'function') {
@@ -665,17 +637,10 @@ function _isSailBlock(blockState) {
               var tagName = tagVariants[i];
               try {
                 var hasTagResult = itemStack.hasTag(tagName);
-                if (blockId.includes('sail')) {
-                  logDetail('isSailBlock '+blockId+' itemStack.hasTag("'+tagName+'") = '+hasTagResult);
-                }
                 if (hasTagResult) {
-                  logDetail('isSailBlock FOUND sail block '+blockId+' via itemStack.hasTag("'+tagName+'") (CORRECT METHOD!)');
                   return true;
                 }
               } catch (tagError) {
-                if (blockId.includes('sail')) {
-                  logDetail('isSailBlock '+blockId+' itemStack.hasTag("'+tagName+'") failed: '+tagError);
-                }
               }
             }
           }
@@ -689,20 +654,13 @@ function _isSailBlock(blockState) {
             
             for (var i = 0; i < tagVariants.length; i++) {
               var tagName = tagVariants[i];
-              try {
                 var itemIsResult = itemStack.is(tagName);
                 if (blockId.includes('sail')) {
                   logDetail('isSailBlock '+blockId+' itemStack.is("'+tagName+'") = '+itemIsResult);
                 }
                 if (itemIsResult) {
-                  logDetail('isSailBlock FOUND sail block '+blockId+' via itemStack.is("'+tagName+'") (FALLBACK METHOD!)');
                   return true;
                 }
-              } catch (tagError) {
-                if (blockId.includes('sail')) {
-                  logDetail('isSailBlock '+blockId+' itemStack.is("'+tagName+'") failed: '+tagError);
-                }
-              }
             }
           } else if (blockId.includes('sail')) {
             logDetail('isSailBlock '+blockId+' itemStack methods - hasTag: '+typeof itemStack.hasTag+', is: '+typeof itemStack.is);
@@ -710,269 +668,8 @@ function _isSailBlock(blockState) {
         } else if (blockId.includes('sail')) {
           logDetail('isSailBlock '+blockId+' item.getDefaultInstance not available, type: '+typeof item.getDefaultInstance);
         }
-      } else if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' block.asItem not available, type: '+typeof block.asItem);
       }
-    } catch (e0) {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' item tag check failed: '+e0);
-      }
-    }
-    
-    // Method 1: Try using KubeJS Utils for tag checking
-    try {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' Method 1: tagManager check starting...');
-      }
-      
-      // Try multiple ways to get the server
-      var server = null;
-      if (global.Utils?.server) {
-        server = global.Utils.server;
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: server from Utils = '+server);
-        }
-      } else if (global.Utils?.getServer && typeof global.Utils.getServer === 'function') {
-        server = global.Utils.getServer();
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: server from getServer() = '+server);
-        }
-      } else if (typeof Utils !== 'undefined' && Utils.server) {
-        server = Utils.server;
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: server from Utils.server = '+server);
-        }
-      }
-      
-      if (server) {
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: server available = '+server);
-        }
-        
-        // Try to access KubeJS's internal tag manager
-        var overworld = server.overworld();
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: overworld = '+overworld);
-        }
-        
-        var tagManager = overworld && overworld.getTagManager ? overworld.getTagManager() : null;
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' tagManager: tagManager = '+tagManager);
-        }
-        
-        if (tagManager) {
-          var blockTags = tagManager.getOrEmpty('minecraft:block');
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' tagManager: blockTags = '+blockTags);
-          }
-          
-          if (blockTags) {
-            var sailTag = blockTags.getTag('minecraft:sail_togglers');
-            if (blockId.includes('sail')) {
-              logDetail('isSailBlock '+blockId+' tagManager: sailTag = '+sailTag);
-            }
-            
-            if (sailTag && sailTag.contains(block)) {
-              logDetail('isSailBlock FOUND sail block '+blockId+' via KubeJS tagManager');
-              return true;
-            } else if (blockId.includes('sail')) {
-              logDetail('isSailBlock '+blockId+' tagManager check = false (tag exists: '+(sailTag != null)+')');
-            }
-          }
-        }
-      } else if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' tagManager: Utils.server not available');
-      }
-    } catch (e1) {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' tagManager check failed: '+e1);
-      }
-    }
-    
-    // Method 2: Try direct ingredient matching (KubeJS way)
-    try {
-      var ingredient = global.Ingredient ? Ingredient.of('#minecraft:sail_togglers') : null;
-      if (ingredient && typeof ingredient.test === 'function') {
-        var itemStack = block.asItem().getDefaultInstance();
-        var testResult = ingredient.test(itemStack);
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' Ingredient.of("#minecraft:sail_togglers").test() = '+testResult);
-        }
-        if (testResult) {
-          logDetail('isSailBlock FOUND sail block '+blockId+' via Ingredient tag test');
-          return true;
-        }
-      } else if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' Ingredient not available or no test method');
-      }
-    } catch (e2) {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' Ingredient tag test failed: '+e2);
-      }
-    }
-    
-    // Method 3: Try blockState.is() with multiple possible tag names
-    var possibleTags = [
-      'minecraft:sail_togglers',
-      'create:windmill_sails', 
-      'vs_sails:sails',
-      'valkyrienskies:sail_togglers',
-      'vs:sail_togglers'
-    ];
-    
-    for (var i = 0; i < possibleTags.length; i++) {
-      var tagName = possibleTags[i];
-      try {
-        if (typeof blockState.is === 'function') {
-          var isResult = blockState.is(tagName);
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' blockState.is("'+tagName+'") = '+isResult);
-          }
-          if (isResult) {
-            logDetail('isSailBlock FOUND sail block '+blockId+' via blockState.is("'+tagName+'")');
-            return true;
-          }
-        }
-      } catch (e3) {
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' blockState.is("'+tagName+'") failed: '+e3);
-        }
-      }
-    }
-    
-    // Method 4: Try direct registry access with proper ResourceLocation
-    try {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' Method 4: direct registry check starting...');
-      }
-      
-      // Try multiple ways to get the server
-      var server = null;
-      if (global.Utils?.server) {
-        server = global.Utils.server;
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' registry: server from Utils = '+server);
-        }
-      } else if (global.Utils?.getServer && typeof global.Utils.getServer === 'function') {
-        server = global.Utils.getServer();
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' registry: server from getServer() = '+server);
-        }
-      } else if (typeof Utils !== 'undefined' && Utils.server) {
-        server = Utils.server;
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' registry: server from Utils.server = '+server);
-        }
-      }
-      
-      if (server) {
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' registry: server available = '+server);
-        }
-        
-        var registryAccess = server.registryAccess();
-        if (blockId.includes('sail')) {
-          logDetail('isSailBlock '+blockId+' registry: registryAccess = '+registryAccess);
-        }
-        
-        if (registryAccess) {
-          // Get the block registry and the tag directly
-          var Registries = Java.loadClass('net.minecraft.core.registries.Registries');
-          var ResourceLocation = Java.loadClass('net.minecraft.resources.ResourceLocation');
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' registry: Java classes loaded');
-          }
-          
-          var blockRegistry = registryAccess.registryOrThrow(Registries.BLOCK);
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' registry: blockRegistry = '+blockRegistry);
-          }
-          
-          var tagKey = Java.loadClass('net.minecraft.tags.TagKey').create(Registries.BLOCK, new ResourceLocation('minecraft', 'sail_togglers'));
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' registry: tagKey = '+tagKey);
-          }
-          
-          var tagOptional = blockRegistry.getTag(tagKey);
-          if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' registry: tagOptional = '+tagOptional+' present='+tagOptional.isPresent());
-          }
-          
-          if (tagOptional.isPresent()) {
-            var tag = tagOptional.get();
-            var blockHolder = blockRegistry.wrapAsHolder(block);
-            var isInTag = tag.contains(blockHolder);
-            
-            if (blockId.includes('sail')) {
-              logDetail('isSailBlock '+blockId+' direct registry tag check = '+isInTag);
-            }
-            
-            if (isInTag) {
-              logDetail('isSailBlock FOUND sail block '+blockId+' via direct registry tag check');
-              return true;
-            }
-          } else if (blockId.includes('sail')) {
-            logDetail('isSailBlock '+blockId+' sail_togglers tag not found in registry');
-            
-            // Debug: List ALL available tags to find the sail tag
-            try {
-              var allTags = blockRegistry.getTags();
-              var tagCount = 0;
-              var allTagsList = [];
-              var sailRelatedTags = [];
-              
-              var tagIterator = allTags.iterator();
-              while (tagIterator.hasNext()) {
-                var tagEntry = tagIterator.next();
-                var tagKey = tagEntry.getFirst();
-                var tagKeyStr = tagKey.toString();
-                
-                allTagsList.push(tagKeyStr);
-                
-                // Look for sail, toggle, vs_sails, or any blocks that might contain our blocks
-                if (tagKeyStr.toLowerCase().includes('sail') || 
-                    tagKeyStr.toLowerCase().includes('toggle') || 
-                    tagKeyStr.includes('vs_sails') ||
-                    tagKeyStr.includes('vs:') ||
-                    tagKeyStr.includes('valkyrien')) {
-                  sailRelatedTags.push(tagKeyStr);
-                }
-                tagCount++;
-              }
-              
-              logDetail('isSailBlock '+blockId+' registry has '+tagCount+' total tags');
-              if (sailRelatedTags.length > 0) {
-                logDetail('isSailBlock '+blockId+' sail-related tags: ['+sailRelatedTags.join(', ')+']');
-              } else {
-                logDetail('isSailBlock '+blockId+' NO sail-related tags found');
-                // Show first 10 and last 10 tags as examples
-                var sampleTags = allTagsList.slice(0, 10).concat(['...'], allTagsList.slice(-10));
-                logDetail('isSailBlock '+blockId+' sample tags: ['+sampleTags.join(', ')+']');
-              }
-            } catch (listError) {
-              logDetail('isSailBlock '+blockId+' tag listing failed: '+listError);
-            }
-          }
-        }
-      } else if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' registry: Utils.server not available');
-      }
-    } catch (e4) {
-      if (blockId.includes('sail')) {
-        logDetail('isSailBlock '+blockId+' direct registry check failed: '+e4);
-      }
-    }
-    
-    // Debug: log some block info occasionally
-    if (Math.random() < 0.05 || blockId.includes('sail')) { // Log 5% or all sail-related blocks
-      logDetail('isSailBlock checked '+blockId+' (not tagged as sail)');
-    }
-    
     return false;
-  } catch (e) {
-    logDetail('isSailBlock error checking '+blockState+': '+e);
-    return false;
-  }
 }
 
 function _processDecay(st) {
@@ -991,7 +688,6 @@ function _processDecay(st) {
   
   // Ensure decay state is properly initialized (for ships that were decaying before the update)
   if (st.decayLayerPositions === undefined || st.decayLayerIndex === undefined || st.decayLastBlockTime === undefined || st.decayBounds === undefined || st.decayChunkCount === undefined) {
-    logTrack('processDecay ship='+st.id+' fixing incomplete decay state - rescanning bounds');
     st.decayBounds = _findActualShipBounds(st.ship, st.level);
     bounds = st.decayBounds;
     st.decayCurrentY = bounds.minY;
@@ -1014,7 +710,6 @@ function _processDecay(st) {
   while (attempts < maxAttempts) {
     // Check if we've processed all layers
     if (st.decayCurrentY > bounds.maxY) {
-      logTrack('processDecay ship='+st.id+' completed, removing ship');
       _completeDecay(st);
       return true; // Signal that ship should be removed
     }
@@ -1023,17 +718,14 @@ function _processDecay(st) {
     if (st.decayLayerIndex >= st.decayLayerPositions.length) {
       st.decayCurrentY++;
       if (st.decayCurrentY > bounds.maxY) {
-        logTrack('processDecay ship='+st.id+' completed, removing ship');
         _completeDecay(st);
         return true;
       }
       _generateShuffledLayer(st);
-      logTrack('processDecay ship='+st.id+' moving to next layer Y='+st.decayCurrentY+' with '+st.decayLayerPositions.length+' positions, speed='+ticksPerBlock+' ticks');
     }
     
     // Get current position from shuffled layer
     var pos = st.decayLayerPositions[st.decayLayerIndex];
-    logTrack('processDecay ship='+st.id+' tick='+currentTick+' processing Y='+st.decayCurrentY+' X='+pos.x+' Z='+pos.z+' ('+st.decayLayerIndex+'/'+(st.decayLayerPositions.length-1)+')');
     
     // Calculate progressive floodfill size based on chunk count: start small, get bigger
     var accelerationChunks = (global.Ships_CFG && global.Ships_CFG.DECAY_ACCELERATION) || 50; // Reach max size after 50 chunks
@@ -1046,7 +738,6 @@ function _processDecay(st) {
     
     // Every 20 chunks, create barrel ships from nearby dropped items using last saved center
     if (st.decayChunkCount > 0 && st.decayChunkCount % 20 === 0 && st.lastSavedCenter) {
-      logTrack('processDecay ship='+st.id+' chunk '+st.decayChunkCount+' triggering periodic barrel collection');
       _createFinalBarrelCollection(st.level, st.lastSavedCenter.x, st.lastSavedCenter.y, st.lastSavedCenter.z, st.id + '_chunk' + st.decayChunkCount);
     }
     
@@ -1069,14 +760,13 @@ function _processDecay(st) {
                 y: currentCenter.y,
                 z: currentCenter.z
               };
-              logDetail('processDecay ship='+st.id+' saved center position: ('+currentCenter.x.toFixed(1)+','+currentCenter.y.toFixed(1)+','+currentCenter.z.toFixed(1)+')');
             }
           }
         } catch (centerErr) {
-          logDetail('processDecay ship='+st.id+' failed to save center position: '+centerErr);
+          // Failed to save center position - continue silently
         }
         
-        logTrack('processDecay ship='+st.id+' chunk '+st.decayChunkCount+' processed '+blocksProcessed+' blocks at ('+pos.x+','+st.decayCurrentY+','+pos.z+') speed='+ticksPerBlock+' ticks floodfill='+floodFillSize+' blocks');
+        // Block processing completed
 
         // Play chunk break sound effect
         _playChunkBreakSound(st, pos.x, st.decayCurrentY, pos.z);
@@ -1100,7 +790,6 @@ function _processBlockClump(level, centerX, centerY, centerZ, ship, floodFillSiz
   // Use floodfill to spread from the center point to adjacent solid blocks
   var blocksProcessed = _floodFillDecay(level, centerX, centerY, centerZ, ship, floodFillSize);
   
-  logDetail('processBlockClump center('+centerX+','+centerY+','+centerZ+') floodfill processed '+blocksProcessed+'/'+floodFillSize+' blocks');
   return blocksProcessed;
 }
 
@@ -1180,8 +869,6 @@ function _generateShuffledLayer(st) {
     st.decayLayerPositions[i] = st.decayLayerPositions[j];
     st.decayLayerPositions[j] = temp;
   }
-  
-  logDetail('generateShuffledLayer Y='+st.decayCurrentY+' generated '+st.decayLayerPositions.length+' shuffled positions');
 }
 
 function _makeBlockFallShipSpace(level, shipSpaceX, shipSpaceY, shipSpaceZ, ship) {
@@ -1206,6 +893,9 @@ function _makeBlockFallShipSpace(level, shipSpaceX, shipSpaceY, shipSpaceZ, ship
     var fallingBlock = FallingBlockEntity.fall(level, shipPos, blockState);
     
     if (fallingBlock) {
+      // Fix UUID collisions by generating a fresh UUID
+      var UUID = Java.loadClass('java.util.UUID');
+      fallingBlock.setUUID(UUID.randomUUID());
       // Add some randomness to prevent UUID collisions and make it look more natural
       var randomOffsetX = Math.random() * 0.6 - 0.3; // Random between -0.3 and 0.3
       var randomOffsetZ = Math.random() * 0.6 - 0.3;
@@ -1290,8 +980,6 @@ function _createPeriodicBarrelShips(st, chunkX, chunkY, chunkZ) {
   
   var collectRadius = 25; // 50x50x50 area (25 blocks in each direction)
   
-  logTrack('createPeriodicBarrelShips ship='+st.id+' chunk '+st.decayChunkCount+' collecting items in 50x50x50 area around world pos ('+worldPos.x+','+worldPos.y+','+worldPos.z+')');
-  
   // Create AABB for item collection around the world position of the processed chunk
   var minX = worldPos.x - collectRadius;
   var minY = Math.max(level.getMinBuildHeight(), worldPos.y - collectRadius);
@@ -1350,8 +1038,6 @@ function _createPeriodicBarrelShips(st, chunkX, chunkY, chunkZ) {
     barrelCount++;
     startIndex += itemsPerBarrel;
   }
-  
-  logTrack('createPeriodicBarrelShips ship='+st.id+' created '+barrelCount+' barrel ships with '+allItems.length+' total items at chunk '+st.decayChunkCount);
 }
 
 
@@ -1496,8 +1182,6 @@ function _completeDecay(st) {
   st.decaying = false;
   st.decayCompleted = true;
   
-  logTrack('completeDecay ship='+st.id+' finished, processed '+st.decayProgress+' blocks in '+st.decayChunkCount+' chunks');
-  
   // Do final barrel collection using last saved center position
   if (st.lastSavedCenter && st.level) {
     logTrack('completeDecay ship='+st.id+' performing final barrel collection at last saved center ('+st.lastSavedCenter.x.toFixed(1)+','+st.lastSavedCenter.y.toFixed(1)+','+st.lastSavedCenter.z.toFixed(1)+')');
@@ -1508,7 +1192,7 @@ function _completeDecay(st) {
   
   var server = st.level ? st.level.server : null;
   if (server) {
-    Ships_broadcast(server, '§8[Ships] Ship '+st.id+' has completely collapsed into the depths... §6Salvage barrel ships are floating away!');
+    Ships_broadcast(server, '§8[Ships] Ship '+st.id+' has completely collapsed into the depths... §6Salvage barrels are floating away!');
   }
 }
 
@@ -1867,7 +1551,7 @@ global.SHIPS_trackAt  = SHIPS_trackAt;
 global.SHIPS_TRACK    = SHIPS_TRACK;
 global.BARREL_TRACK   = BARREL_TRACK;
 global.TRACK_CFG      = TRACK_CFG;
-global.TRACK_DBG      = TRACK_DBG;
+global.TRACK_DBG      = global.TRACK_DBG || false; // Initialize if not set by commands
 global._processBarrelCleanup = _processBarrelCleanup;
 global._cleanupAllBarrels = _cleanupAllBarrels;
 
@@ -1912,14 +1596,10 @@ ServerEvents.tick(function(event){
         // Initialize sail decay for ships that started decaying before this feature was added
         st.sailDecayActive = true;
         st.sailDecayLastTime = 0;
-        logDetail('decay loop initializing sail decay for existing ship '+st.id);
       }
       
       if (st.sailDecayActive) {
-        logDetail('decay loop calling _processSailDecay for ship '+st.id);
         _processSailDecay(st); // Run continuous sail decay in parallel
-      } else {
-        logDetail('decay loop skipping sail decay for ship '+st.id+' (not active)');
       }
       
       if (shouldRemove) {
@@ -1930,11 +1610,11 @@ ServerEvents.tick(function(event){
             delete SHIPS_TRACK[id];
           }
         } catch(e) { 
-          logDetail('decay removal error: '+e);
+          // Decay removal error - continue silently
         }
       }
     }
   } catch(e) {
-    logDetail('decay loop error: '+e);
+    // Decay loop error - continue silently
   }
 });
