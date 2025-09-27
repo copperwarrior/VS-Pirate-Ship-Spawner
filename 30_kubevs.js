@@ -458,70 +458,40 @@ global = global || this; // Rhino: ensure we have a global object
       },
 
       createShip: function (level, blockPos) {
+        logFn('createShip: Using KubeVS creator advice - Rhino auto-wrapping approach');
         if (!level || !blockPos) return null;
         
         try {
-          // Use the correct method signature from VS2 source code
-          if (typeof ShipAssemblyKt !== 'undefined') {
-            var DenseBlockPosSet = Java.loadClass('org.valkyrienskies.core.util.datastructures.DenseBlockPosSet');
-            var blockPosSet = new DenseBlockPosSet();
-            blockPosSet.add(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+          // Method 1: Try accessing ShipAssemblyKt as global variable (from logs we see it's available)
+          try {
+            logFn('createShip: Trying global ShipAssemblyKt variable access');
             
-            // CORRECT ORDER: centerBlock, blocks, level
-            var ship = ShipAssemblyKt.createNewShipWithBlocks(blockPos, blockPosSet, level);
-            if (ship) {
-              logFn('createShip: SUCCESS - Created VS ship: ' + ship);
-              return ship;
-            } else {
-              logFn('createShip: Method call succeeded but returned null ship');
-              return null;
-            }
-          } else {
-            logFn('createShip: ShipAssemblyKt not available');
-            return null;
-          }
-        } catch (createErr) {
-          logFn('createShip: Error: ' + createErr);
-          return null;
-        },
-
-      _reinit: function(){ try { initKubeVSBridge(); return true; } catch(e){ console.log(TAG + ' reinit error: ' + e); return false; } },
-      _forceWire: function(className, methodName){
-        console.log(TAG + ' forceWire stub → ' + className + '.' + methodName);
-        return true;
-      }
-    };
-
-    // Expose ShipAssemblyKt globally for ship creation
-    if (ShipAssemblyKt) {
-      global.ShipAssemblyKt = ShipAssemblyKt;
-      logFn('ShipAssemblyKt exposed globally');
-    } else {
-      logFn('ShipAssemblyKt not available');
-    }
-
-    global.KubeVS = kubeVS;
-    logFn('ready (no-reflection).');
-
-  } catch (e) {
-    logFn('init error: ' + e);
-    global.KubeVS = {
-      shipsInAABB: function () {
-        throw new Error('shipsInAABB unavailable: init error.');
-      },
-      shipId: function(){ return 'unknown'; },
-      shipSlug: function(){ return null; },
-      shipCenterWorld: function(){ return { x:0, y:0, z:0 }; },
-      entitiesInShip: function(){ return []; },
-      isShipValid: function(){ return true; },
-      isShipLoaded: function(){ return true; },
-      removeShip: function(){ return false; },
-      createShip: function(){ return null; },
-      _reinit: function(){ return false; },
-      _forceWire: function(){ return false; }
-    };
-  }
-})();
+            if (typeof ShipAssemblyKt !== 'undefined') {
+              logFn('createShip: Found global ShipAssemblyKt: ' + ShipAssemblyKt);
+              
+              // Try different approaches to discover methods
+              try {
+                logFn('createShip: === ShipAssemblyKt Method Discovery ===');
+                
+                // Method 1: Direct Java class access for reflection
+                try {
+                  logFn('createShip: Attempting Java reflection via Java.loadClass');
+                  var ShipAssemblyClass = Java.loadClass('org.valkyrienskies.mod.common.assembly.ShipAssemblyKt');
+                  var methods = ShipAssemblyClass.getDeclaredMethods();
+                  
+                  logFn('createShip: Found ' + methods.length + ' declared methods via reflection:');
+                  for (var m = 0; m < Math.min(methods.length, 30); m++) {
+                    var method = methods[m];
+                    var methodName = method.getName();
+                    var paramTypes = method.getParameterTypes();
+                    var paramStr = '';
+                    
+                    for (var pt = 0; pt < paramTypes.length; pt++) {
+                      if (pt > 0) paramStr += ', ';
+                      paramStr += paramTypes[pt].getSimpleName();
+                    }
+                    
+                    logFn('createShip: - ' + methodName + '(' + paramStr + ')');
                   }
                 } catch (reflectionErr) {
                   logFn('createShip: Java reflection failed: ' + reflectionErr);

@@ -5,13 +5,17 @@ var AABB = Java.loadClass('net.minecraft.world.phys.AABB');
 
 var KubeVS = global.KubeVS || null;
 if (!KubeVS) {
+  // Very explicit message so we don’t chase ghosts
   console.error('[Ships/Track] global.KubeVS is missing. Ensure ships/30_kubevs.js attaches global.KubeVS (Rhino has no globalThis).');
 }
+
+var VSGameUtils = null;
+try { VSGameUtils = Java.loadClass('org.valkyrienskies.mod.common.VSGameUtilsKt'); } catch(_){ }
 
 // persistent maps/flags (Rhino-safe)
 var SHIPS_TRACK = SHIPS_TRACK || {}; // shipId -> state
 var BARREL_TRACK = BARREL_TRACK || {}; // barrelId -> { ship, level, pos, createTime }
-var TRACK_DBG   = (typeof TRACK_DBG === 'boolean') ? TRACK_DBG : false; // default: off
+var TRACK_DBG   = (typeof TRACK_DBG === 'boolean') ? TRACK_DBG : true; // default: on
 
 function logDetail(msg){
   if (!TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
@@ -20,7 +24,7 @@ function logDetail(msg){
 
 function logTrack(msg){
   if (!TRACK_DBG && !global.DEBUG && !(global.Ships_CFG && global.Ships_CFG.DEBUG)) return;
-  try { console.log('[Ships/Track] '+msg); } catch(_){ }
+  try { console.log('[Ships/TrackDBG] '+msg); } catch(_){ }
 }
 
 // --- config used by the tracker ---
@@ -44,126 +48,390 @@ function schedule(server, ticks, fn){
 function resolveShipByAabb(level, x, y, z) {
   var rx = TRACK_CFG.aabb.rx, ry = TRACK_CFG.aabb.ry, rz = TRACK_CFG.aabb.rz;
   var box = new AABB(x - rx, y - ry, z - rz, x + rx, y + ry, z + rz);
-  
+
+  dbg(level.server, 'resolving via AABB center='+x+','+y+','+z+' half=' + rx + '/' + ry + '/' + rz);
+  logTrack('resolveShipByAabb center='+x+','+y+','+z+' half='+rx+'/'+ry+'/'+rz+' box='+box);
+
+  var list = null;
   try {
-    var ships = KubeVS.shipsInAABB(level, box);
-    if (ships && ships.length > 0) {
-      return ships[0]; // Return first ship found
+    list = KubeVS.shipsInAABB(level, box);
+  } catch(e) {
+    err(level.server, 'KubeVS.shipsInAABB threw: ' + e);
+    logDetail('shipsInAABB threw '+e);
+    return null;
+  }
+
+  if (!list || list.length === 0) {
+    dbg(level.server, 'AABB found 0 ships.');
+    logDetail('resolveShipByAabb found 0 ships');
+    return null;
+  }
+
+  dbg(level.server, 'AABB found ' + list.length + ' ship(s). Listing centers & ids:');
+  var best = null, bestD2 = 1/0;
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i];
+    var id = '<unknown>';
+    var cx = 0, cy = 0, cz = 0;
+    try { id = ''+KubeVS.shipId(s); } catch(e){}
+    try {
+      var c = KubeVS.shipCenterWorld(s);
+      cx = c.x|0; cy = c.y|0; cz = c.z|0;
+    } catch(e) { }
+    dbg(level.server, '  - ship id='+id+' center='+cx+','+cy+','+cz);
+    logTrack('resolveShipByAabb candidate id='+id+' center='+cx+','+cy+','+cz);
+
+    var dx = cx - x, dy = cy - y, dz = cz - z;
+    var d2 = dx*dx + dy*dy + dz*dz;
+    if (d2 < bestD2) { bestD2 = d2; best = s; }
+  }
+
+  try {
+    var chosenId = ''+KubeVS.shipId(best);
+    dbg(level.server, 'chosen nearest ship id='+chosenId+' (d2='+bestD2+')');
+    logTrack('resolveShipByAabb chose id='+chosenId+' d2='+bestD2);
+  } catch(e) { dbg(level.server, 'chosen ship (id unknown)'); logTrack('resolveShipByAabb chose unknown '+e); }
+
+  return best;
+}
+
+function stopTracking(server, shipId){
+  var st = SHIPS_TRACK[shipId];
+  if (!st) return;
+  st.dead = true;
+  delete SHIPS_TRACK[shipId];
+  dbg(server, 'stopped tracking ship '+shipId);
+}
+
+function _matchShipFromList(list, targetId, targetSlug){
+  if (!list || !list.length) return null;
+  for (var i = 0; i < list.length; i++) {
+    var cand = list[i];
+    if (!cand) continue;
+    var cid = null; var cslug = null;
+    try { cid = String(KubeVS.shipId(cand)); } catch(_){ }
+    try { cslug = KubeVS.shipSlug(cand); } catch(_){ }
+    if ((cid && targetId && cid === targetId) || (cslug && targetSlug && cslug === targetSlug)) {
+      return cand;
     }
-  } catch (e) {
-    logDetail('resolveShipByAabb error: ' + e);
   }
   return null;
 }
 
-// ---------- tracking functions ----------
-function SHIPS_trackAt(level, x, y, z, server) {
-  if (!level || !server) return;
-  
-  logTrack('/shiptrack here ? '+x+','+y+','+z);
-  
-  var ship = resolveShipByAabb(level, x, y, z);
-  if (!ship) {
-    err(server, 'No ship found at position');
-    return;
+function _refreshShip(st){
+  if (!st || !st.level) return;
+  var level = st.level;
+  var targetId = st.id;
+  var targetSlug = st.slug || null;
+  var hint = st.lastCenterWorld || { x: +(st.anchorX || 0), y: +(st.anchorY || 64), z: +(st.anchorZ || 0) };
+  var refreshed = null;
+  logTrack('refreshShip start id='+targetId+' slug='+(targetSlug||'(none)')+' hint='+hint.x+','+hint.y+','+hint.z+' numeric='+st.numericId);
+
+  // Use existing ship object if available
+  if (st.ship) {
+    refreshed = st.ship;
+    logDetail('refreshShip using stored ship object -> hit');
   }
-  
-  var id = KubeVS.shipId(ship);
-  if (!id) {
-    err(server, 'Ship found but no ID available');
-    return;
+
+  if (!refreshed && typeof st.numericId === 'number') {
+    try {
+      refreshed = KubeVS.shipByNumericId ? KubeVS.shipByNumericId(level, st.numericId) : null;
+      logDetail('refreshShip shipByNumericId -> '+(refreshed?'hit':'miss'));
+    } catch(ex){ logDetail('refreshShip shipByNumericId threw '+ex); }
   }
-  
-  if (SHIPS_TRACK[id]) {
-    dbg(server, 'already tracking ship '+id);
-    return;
+
+  if (!refreshed && KubeVS.shipBySlug && targetSlug) {
+    refreshed = KubeVS.shipBySlug(level, targetSlug);
+    logDetail('refreshShip shipBySlug -> '+(refreshed?'hit':'miss'));
   }
-  
-  // Create tracking state
-  var st = {
-    id: id,
-    ship: ship,
-    level: level,
-    decaying: false,
-    decayCompleted: false,
-    finalBarrelsCreated: false
-  };
-  
-  SHIPS_TRACK[id] = st;
-  dbg(server, 'now tracking ship '+id);
+
+  if (!refreshed && KubeVS.resolveShipById) {
+    var key = (typeof st.numericId === 'number' && isFinite(st.numericId)) ? st.numericId : targetId;
+    try { refreshed = KubeVS.resolveShipById(level, key, hint.x, hint.y, hint.z); } catch(ex){ logDetail('refreshShip resolveShipById threw '+ex); }
+    logDetail('refreshShip resolveShipById -> '+(refreshed?'hit':'miss'));
+  }
+
+  if (!refreshed && VSGameUtils && typeof VSGameUtils.getShipObjectById === 'function' && typeof st.numericId === 'number') {
+    try { refreshed = VSGameUtils.getShipObjectById(level, st.numericId); } catch(ex){ logDetail('refreshShip VS getShipObjectById threw '+ex); }
+    logDetail('refreshShip VS getShipObjectById -> '+(refreshed?'hit':'miss'));
+  }
+
+  if (!refreshed) {
+    var origins = [];
+    origins.push(hint);
+    origins.push({ x: +(st.anchorX || 0), y: +(st.anchorY || 64), z: +(st.anchorZ || 0) });
+    origins.push({ x: 0, y: hint.y || 64, z: 0 });
+
+    var radii = [128, 512, 2048, 8192];
+    for (var oi = 0; oi < origins.length && !refreshed; oi++) {
+      var origin = origins[oi];
+      if (!origin || !isFinite(origin.x) || !isFinite(origin.y) || !isFinite(origin.z)) continue;
+      for (var ri = 0; ri < radii.length && !refreshed; ri++) {
+        var r = radii[ri];
+        var box = new AABB(origin.x - r, origin.y - 256, origin.z - r, origin.x + r, origin.y + 256, origin.z + r);
+        try {
+          var list = KubeVS.shipsInAABB(level, box);
+          refreshed = _matchShipFromList(list, targetId, targetSlug);
+        } catch(ex){ logDetail('refreshShip shipsInAABB radius '+r+' threw '+ex); }
+        logDetail('refreshShip scan origin='+origin.x+','+origin.y+','+origin.z+' r='+r+' -> '+(refreshed?'hit':'miss'));
+      }
+    }
+  }
+
+  if (!refreshed) {
+    try {
+      var worldShips = KubeVS.allShips ? KubeVS.allShips(level) : [];
+      refreshed = _matchShipFromList(worldShips, targetId, targetSlug);
+    } catch(ex){ logDetail('refreshShip allShips threw '+ex); }
+    logDetail('refreshShip allShips -> '+(refreshed?'hit':'miss'));
+  }
+
+  if (!refreshed && VSGameUtils && typeof VSGameUtils.getShipsIntersecting === 'function') {
+    try {
+      var big = 3.0e7;
+      var minY = (typeof level.minBuildHeight === 'number') ? level.minBuildHeight : -64;
+      var maxY = (typeof level.maxBuildHeight === 'number') ? level.maxBuildHeight : 320;
+      var worldBox = new AABB(-big, minY, -big, big, maxY, big);
+      var viaVs = VSGameUtils.getShipsIntersecting(level, worldBox);
+      var listArr = viaVs ? (viaVs.toArray ? viaVs.toArray() : viaVs) : [];
+      refreshed = _matchShipFromList(listArr, targetId, targetSlug);
+      logDetail('refreshShip VS getShipsIntersecting -> '+(refreshed?'hit':'miss'+' count='+(listArr && listArr.length)))
+    } catch(ex){ logDetail('refreshShip VS getShipsIntersecting threw '+ex); }
+  }
+
+  if (refreshed) {
+    st.ship = refreshed;
+    if (!st.slug) {
+      try { st.slug = KubeVS.shipSlug(refreshed); } catch(_slug){ }
+    }
+    logDetail('refreshShip success id='+targetId+' slug='+(st.slug||'(none)'));
+  } else {
+    logDetail('refreshShip failed to find ship id='+targetId);
+  }
 }
 
-function SHIPS_canSpawn() {
-  var keys = Object.keys(SHIPS_TRACK || {});
-  for (var i = 0; i < keys.length; i++) {
-    var st = SHIPS_TRACK[keys[i]];
-    if (st && st.ship && st.level) {
-      // Check if ship is loaded
-      try {
-        var center = KubeVS.shipCenterWorld(st.ship);
-        if (center) {
-          var BlockPos = Java.loadClass('net.minecraft.core.BlockPos');
-          var centerPos = new BlockPos(Math.floor(center.x), Math.floor(center.y), Math.floor(center.z));
-          if (st.level.isLoaded(centerPos)) {
-            // Check for pirates on board
-            var pirateCount = _countPiratesOnShip(st.level, st.ship);
-            if (pirateCount === 0 && !st.decaying) {
-              // Start decay
-              _initDecay(st);
-            }
-            return false; // Don't spawn new ships while this one exists
+function _isChunkLoadedNow(level, chunkX, chunkZ){
+  try {
+    if (typeof level.getChunkSource === 'function'){
+      var src = level.getChunkSource();
+      if (src && typeof src.getChunkNow === 'function') return src.getChunkNow(chunkX|0, chunkZ|0) != null;
+    }
+  } catch(_){ }
+  return false;
+}
+
+function _isShipLoaded(level, ship, cx, cy, cz){
+  if (!isFinite(cx) || !isFinite(cy) || !isFinite(cz)) return true; // unknown center → assume loaded to avoid false deletes
+  var chunkX = Math.floor(cx / 16);
+  var chunkZ = Math.floor(cz / 16);
+  return _isChunkLoadedNow(level, chunkX, chunkZ);
+}
+
+function _computeCenters(st){
+  var level = st.level;
+  var ship = st.ship;
+  var anchor = { x:+(st.anchorX||0), y:+(st.anchorY||0), z:+(st.anchorZ||0) };
+  logTrack('computeCenters start id='+st.id);
+  var resultWorld = null;
+  var resultShip = null;
+
+  if (KubeVS.worldToShipVec) {
+    var shipspace = KubeVS.worldToShipVec(level, ship, anchor.x, anchor.y, anchor.z);
+    logDetail('computeCenters worldToShipVec(anchor) -> '+(shipspace? (shipspace.x+','+shipspace.y+','+shipspace.z) : 'null'));
+    if (shipspace && isFinite(shipspace.x) && isFinite(shipspace.y) && isFinite(shipspace.z)) {
+      resultShip = shipspace;
+      if (KubeVS.shipToWorldVec) {
+        var worldBack = KubeVS.shipToWorldVec(level, ship, shipspace.x, shipspace.y, shipspace.z);
+        logDetail('computeCenters shipToWorldVec(reproject) -> '+(worldBack? (worldBack.x+','+worldBack.y+','+worldBack.z) : 'null'));
+        if (worldBack && isFinite(worldBack.x) && isFinite(worldBack.y) && isFinite(worldBack.z)) {
+          resultWorld = worldBack;
+        }
+      }
+    }
+  }
+
+  if (!resultShip) {
+    if (KubeVS.shipToWorldVec) {
+      var zero = KubeVS.shipToWorldVec(level, ship, 0, 0, 0);
+      logDetail('computeCenters shipToWorldVec(0,0,0) -> '+(zero? (zero.x+','+zero.y+','+zero.z) : 'null'));
+      if (zero && isFinite(zero.x) && isFinite(zero.y) && isFinite(zero.z)) {
+        resultWorld = zero;
+        if (KubeVS.worldToShipVec) {
+          var shipzero = KubeVS.worldToShipVec(level, ship, zero.x, zero.y, zero.z);
+          logDetail('computeCenters worldToShipVec(re-zero) -> '+(shipzero? (shipzero.x+','+shipzero.y+','+shipzero.z) : 'null'));
+          if (shipzero && isFinite(shipzero.x) && isFinite(shipzero.y) && isFinite(shipzero.z)) {
+            resultShip = shipzero;
           }
         }
-      } catch (e) {
-        logDetail('canSpawn check error for ship '+st.id+': '+e);
       }
     }
   }
-  return true; // Can spawn new ships
-}
 
-function SHIPS_removeOldShips() {
-  var removed = 0;
-  var keys = Object.keys(SHIPS_TRACK || {});
-  
-  keys.forEach(function(id) {
-    var st = SHIPS_TRACK[id];
-    if (!st || !st.ship || !st.level) return;
-    
+  if (!resultWorld) {
     try {
-      var center = KubeVS.shipCenterWorld(st.ship);
-      if (center) {
-        var BlockPos = Java.loadClass('net.minecraft.core.BlockPos');
-        var centerPos = new BlockPos(Math.floor(center.x), Math.floor(center.y), Math.floor(center.z));
-        if (!st.level.isLoaded(centerPos)) {
-          // Ship is unloaded, remove it
-          KubeVS.removeShip(st.level, st.ship);
-          delete SHIPS_TRACK[id];
-          removed++;
-        }
+      var c = KubeVS.shipCenterWorld(ship);
+      logDetail('computeCenters shipCenterWorld -> '+(c? (c.x+','+c.y+','+c.z) : 'null'));
+      if (c && isFinite(c.x) && isFinite(c.y) && isFinite(c.z) && !(c.x===0 && c.y===0 && c.z===0)) {
+        resultWorld = { x:+c.x, y:+c.y, z:+c.z, source:'vs' };
       }
-    } catch (e) {
-      // Ship probably doesn't exist anymore
-      delete SHIPS_TRACK[id];
-      removed++;
-    }
-  });
-  
-  return removed;
+    } catch(ex){ logDetail('computeCenters shipCenterWorld threw '+ex); }
+  }
+
+  if (!resultWorld) {
+    resultWorld = { x:anchor.x, y:anchor.y, z:anchor.z, source:'anchor' };
+    logTrack('computeCenters world fallback anchor');
+  }
+  if (!resultShip) {
+    resultShip = { x:0, y:0, z:0, source:'fallback' };
+    logDetail('computeCenters ship fallback 0,0,0');
+  }
+
+  logDetail('computeCenters result world='+resultWorld.x+','+resultWorld.y+','+resultWorld.z+' ship='+resultShip.x+','+resultShip.y+','+resultShip.z);
+  return { world:resultWorld, ship:resultShip };
 }
 
-// ---------- pirate detection ----------
+function _resolveCenter(st){
+  if (!st || !st.level) throw new Error('resolveCenter missing state level');
+
+  _refreshShip(st);
+
+  var world = KubeVS.shipCenterWorld(st.ship);
+  if (!world || !isFinite(world.x) || !isFinite(world.y) || !isFinite(world.z)) {
+    throw new Error('shipCenterWorld returned invalid value for ship '+st.id+' -> '+world);
+  }
+
+  var shipVec = KubeVS.worldToShipVec(st.level, st.ship, world.x, world.y, world.z);
+  if (!shipVec || !isFinite(shipVec.x) || !isFinite(shipVec.y) || !isFinite(shipVec.z)) {
+    throw new Error('worldToShipVec returned invalid value for ship '+st.id);
+  }
+
+  st.lastCenterWorld = { x:+world.x, y:+world.y, z:+world.z, source:'vs' };
+  st.lastCenterShip = { x:+shipVec.x, y:+shipVec.y, z:+shipVec.z, source:'vs' };
+
+  logTrack('resolveCenter world='+world.x+','+world.y+','+world.z+' ship='+shipVec.x+','+shipVec.y+','+shipVec.z);
+  return st.lastCenterWorld;
+}
+
+// === PIRATE DETECTION & DECAY SYSTEM ===
+
 function _countPiratesOnShip(level, ship) {
   try {
-    var pirates = KubeVS.entitiesInShip(level, ship, 'pirates:pirate');
-    return pirates ? pirates.length : 0;
-  } catch (e) {
+    var entities = KubeVS.entitiesInShip(level, ship, 'pirates:pirate') || [];
+    logTrack('countPiratesOnShip found '+entities.length+' pirates');
+    return entities.length;
+  } catch(e) {
     logDetail('countPiratesOnShip error: '+e);
     return 0;
   }
 }
 
-// ---------- decay system ----------
+function _findActualShipBounds(ship, level) {
+  try {
+    var transform = ship.getTransform();
+    var shipCenter = transform.positionInShip;
+    
+    // Try to get ship AABB first for initial bounds  
+    // Use actual world height limits from the level
+    var worldMinY = level.getMinBuildHeight(); // Usually -64
+    var worldMaxY = level.getMaxBuildHeight() - 1; // Usually 319
+    
+    // Convert world Y to relative Y (relative to ship center)
+    var relativeMinY = worldMinY - Math.floor(shipCenter.y);
+    var relativeMaxY = worldMaxY - Math.floor(shipCenter.y);
+    
+    var searchBounds = { minX: -100, minY: relativeMinY, minZ: -100, maxX: 100, maxY: relativeMaxY, maxZ: 100 };
+    
+    logDetail('findActualShipBounds world Y range: '+worldMinY+' to '+worldMaxY+', relative to ship center: '+relativeMinY+' to '+relativeMaxY);
+    
+    if (ship && typeof ship.getShipAABB === 'function') {
+      var aabb = ship.getShipAABB();
+      if (aabb) {
+        // Debug: Print raw AABB values
+        logDetail('findActualShipBounds RAW AABB: minX='+aabb.minX+' minY='+aabb.minY+' minZ='+aabb.minZ+' maxX='+aabb.maxX+' maxY='+aabb.maxY+' maxZ='+aabb.maxZ);
+        logDetail('findActualShipBounds ship center: x='+shipCenter.x+' y='+shipCenter.y+' z='+shipCenter.z);
+        
+        // Use AABB coordinates directly - they are exact ship-space block coordinates
+        var aabbBounds = {
+          minX: Math.floor(aabb.minX),
+          minY: Math.floor(aabb.minY),
+          minZ: Math.floor(aabb.minZ),
+          maxX: Math.ceil(aabb.maxX),
+          maxY: Math.ceil(aabb.maxY),
+          maxZ: Math.ceil(aabb.maxZ)
+        };
+        
+        logDetail('findActualShipBounds DIRECT ship-space bounds: '+aabbBounds.minX+','+aabbBounds.minY+','+aabbBounds.minZ+' to '+aabbBounds.maxX+','+aabbBounds.maxY+','+aabbBounds.maxZ);
+        
+        // Calculate dimensions for verification
+        var width = aabbBounds.maxX - aabbBounds.minX + 1;
+        var height = aabbBounds.maxY - aabbBounds.minY + 1;
+        var length = aabbBounds.maxZ - aabbBounds.minZ + 1;
+        logDetail('findActualShipBounds ship dimensions: '+width+'x'+height+'x'+length+' blocks');
+        
+        // Use AABB bounds directly - they are the exact ship-space coordinates
+        return aabbBounds;
+      } else {
+        logDetail('findActualShipBounds ship.getShipAABB() returned null');
+      }
+    } else {
+      logDetail('findActualShipBounds ship.getShipAABB is not a function or ship is null');
+    }
+    
+    // Now scan from bottom up to find the actual lowest block
+    var actualMinY = null;
+    var actualMaxY = null;
+    var actualMinX = null, actualMaxX = null, actualMinZ = null, actualMaxZ = null;
+    var blocksFound = 0;
+    
+    logDetail('findActualShipBounds scanning for actual blocks...');
+    
+    for (var y = searchBounds.minY; y <= searchBounds.maxY && blocksFound < 100; y++) {
+      for (var x = searchBounds.minX; x <= searchBounds.maxX && blocksFound < 100; x++) {
+        for (var z = searchBounds.minZ; z <= searchBounds.maxZ && blocksFound < 100; z++) {
+          // Calculate actual ship-space coordinates
+          var actualX = shipCenter.x + x;
+          var actualY = shipCenter.y + y;
+          var actualZ = shipCenter.z + z;
+          
+          var blockPos = new BlockPos(Math.floor(actualX), Math.floor(actualY), Math.floor(actualZ));
+          var blockState = level.getBlockState(blockPos);
+          
+          if (!blockState.isAir()) {
+            blocksFound++;
+            if (actualMinY === null || y < actualMinY) actualMinY = y;
+            if (actualMaxY === null || y > actualMaxY) actualMaxY = y;
+            if (actualMinX === null || x < actualMinX) actualMinX = x;
+            if (actualMaxX === null || x > actualMaxX) actualMaxX = x;
+            if (actualMinZ === null || z < actualMinZ) actualMinZ = z;
+            if (actualMaxZ === null || z > actualMaxZ) actualMaxZ = z;
+            
+            if (blocksFound <= 10) {
+              logDetail('findActualShipBounds found block '+blocksFound+' at relative('+x+','+y+','+z+') shipspace('+Math.floor(actualX)+','+Math.floor(actualY)+','+Math.floor(actualZ)+') = '+blockState.getBlock());
+            }
+          }
+        }
+      }
+    }
+    
+    if (actualMinY !== null) {
+      var result = {
+        minX: actualMinX, minY: actualMinY, minZ: actualMinZ,
+        maxX: actualMaxX, maxY: actualMaxY, maxZ: actualMaxZ
+      };
+      logDetail('findActualShipBounds found '+blocksFound+' blocks, actual bounds: '+actualMinX+','+actualMinY+','+actualMinZ+' to '+actualMaxX+','+actualMaxY+','+actualMaxZ);
+      return result;
+    } else {
+      logDetail('findActualShipBounds no blocks found, using search bounds');
+      return searchBounds;
+    }
+    
+  } catch(e) {
+    logDetail('findActualShipBounds error: '+e);
+    // Fallback to reasonable relative bounds if we can't get world limits
+    return { minX: -100, minY: -100, minZ: -100, maxX: 100, maxY: 100, maxZ: 100 };
+  }
+}
+
 function _initDecay(st) {
   if (st.decaying) return; // Already decaying
   
@@ -182,387 +450,869 @@ function _initDecay(st) {
   st.sailDecayLastTime = 0; // Track timing for sail decay
   st.sailDecayActive = true; // Enable continuous sail decay
   
-  logTrack('initDecay ship='+st.id+' bounds=('+st.decayBounds.minX+','+st.decayBounds.minY+','+st.decayBounds.minZ+') to ('+st.decayBounds.maxX+','+st.decayBounds.maxY+','+st.decayBounds.maxZ+')');
-}
-
-function _findActualShipBounds(ship, level) {
+  // Initialize first layer
+  _generateShuffledLayer(st);
+  
+  // Debug ship positioning
   try {
-    var aabb = KubeVS.shipAABB ? KubeVS.shipAABB(ship) : null;
-    if (aabb) {
-      return {
-        minX: Math.floor(aabb.minX),
-        minY: Math.floor(aabb.minY),
-        minZ: Math.floor(aabb.minZ),
-        maxX: Math.floor(aabb.maxX),
-        maxY: Math.floor(aabb.maxY),
-        maxZ: Math.floor(aabb.maxZ)
-      };
-    }
-  } catch (e) {
-    logDetail('findActualShipBounds error: '+e);
+    var transform = st.ship.getTransform();
+    var shipSpacePos = transform.positionInShip;
+    var worldPos = transform.positionInWorld;
+    logTrack('initDecay ship='+st.id+' actual bounds='+st.decayBounds.minX+','+st.decayBounds.minY+','+st.decayBounds.minZ+' to '+st.decayBounds.maxX+','+st.decayBounds.maxY+','+st.decayBounds.maxZ);
+    logTrack('initDecay ship='+st.id+' shipSpacePos='+shipSpacePos.x+','+shipSpacePos.y+','+shipSpacePos.z+' worldPos='+worldPos.x+','+worldPos.y+','+worldPos.z);
+    logTrack('initDecay ship='+st.id+' starting at actual bottom Y='+st.decayCurrentY+' (found by scanning)');
+  } catch(e) {
+    logTrack('initDecay ship='+st.id+' debug error: '+e);
   }
   
-  // Fallback to default bounds
-  var CFG = global.Ships_CFG;
-  var center = KubeVS.shipCenterWorld(ship);
-  var cx = center ? Math.floor(center.x) : 0;
-  var cy = center ? Math.floor(center.y) : 64;
-  var cz = center ? Math.floor(center.z) : 0;
-  var r = CFG.DECAY_DEFAULT_BOUNDS;
-  var h = CFG.DECAY_DEFAULT_HEIGHT;
+  var server = st.level ? st.level.server : null;
+  if (server) {
+    Ships_broadcast(server, '§6[Ships] Ship '+st.id+' ('+st.slug+') is beginning to collapse!');
+  }
+}
+
+function _processSailDecay(st) {
+  if (!st || !st.ship || !st.level || !st.sailDecayActive) {
+    logDetail('processSailDecay early exit: st='+!!st+' ship='+!!st?.ship+' level='+!!st?.level+' active='+!!st?.sailDecayActive);
+    return;
+  }
   
-  return {
-    minX: cx - r, maxX: cx + r,
-    minY: cy - h, maxY: cy + h,
-    minZ: cz - r, maxZ: cz + r
-  };
+  var currentTick = global.Ships_tickCounter();
+  var sailDecayInterval = 20; // 1 second (20 ticks)
+  
+  logDetail('processSailDecay ship='+st.id+' tick='+currentTick+' lastTime='+st.sailDecayLastTime+' interval='+sailDecayInterval);
+  
+  // Check if enough time has passed since last sail decay
+  if (currentTick - st.sailDecayLastTime < sailDecayInterval) {
+    return; // Not time yet
+  }
+  
+  var level = st.level;
+  var bounds = st.decayBounds;
+  
+  // Find sail blocks starting from the top of the ship
+  var sailBlocks = [];
+  var totalBlocksChecked = 0;
+  var sailBlocksFound = 0;
+  
+  logDetail('processSailDecay ship='+st.id+' searching bounds Y='+bounds.minY+' to '+bounds.maxY+' X='+bounds.minX+' to '+bounds.maxX+' Z='+bounds.minZ+' to '+bounds.maxZ);
+  
+  // Search from top to bottom for sail blocks
+  for (var y = bounds.maxY; y >= bounds.minY && sailBlocks.length === 0; y--) {
+    // Try several random X,Z positions at this Y level
+    for (var attempts = 0; attempts < 10; attempts++) {
+      var randomX = bounds.minX + Math.floor(Math.random() * (bounds.maxX - bounds.minX + 1));
+      var randomZ = bounds.minZ + Math.floor(Math.random() * (bounds.maxZ - bounds.minZ + 1));
+      
+      var shipPos = new BlockPos(randomX, y, randomZ);
+      var blockState = level.getBlockState(shipPos);
+      totalBlocksChecked++;
+      
+      if (!blockState.isAir()) {
+        var isSail = _isSailBlock(blockState);
+        if (isSail) {
+          sailBlocksFound++;
+          logDetail('processSailDecay ship='+st.id+' found sail block at ('+randomX+','+y+','+randomZ+'): '+blockState.getBlock());
+        }
+        
+        if (isSail) {
+          sailBlocks.push({x: randomX, y: y, z: randomZ});
+          break; // Found one at this level, use it
+        }
+      }
+    }
+  }
+  
+  logDetail('processSailDecay ship='+st.id+' checked '+totalBlocksChecked+' blocks, found '+sailBlocksFound+' sail blocks, selected '+sailBlocks.length+' for processing');
+  
+  if (sailBlocks.length > 0) {
+    var startPos = sailBlocks[0];
+    var CFG = global.Ships_CFG;
+    var sailFloodfillSize = CFG.SAIL_FLOODFILL_SIZE || 20;
+    var sailsRemoved = _floodFillSailDecay(level, startPos.x, startPos.y, startPos.z, st.ship, sailFloodfillSize);
+    
+    if (sailsRemoved > 0) {
+      st.sailDecayLastTime = currentTick;
+      logDetail('processSailDecay ship='+st.id+' removed '+sailsRemoved+' sail blocks via floodfill');
+      
+      // Play sack break sound for sail decay
+      _playSailBreakSound(st, startPos.x, startPos.y, startPos.z);
+    }
+  }
+}
+
+function _floodFillSailDecay(level, startX, startY, startZ, ship, maxBlocks) {
+  var visited = new Set();
+  var toProcess = [];
+  var blocksProcessed = 0;
+  
+  // Start with the initial position
+  toProcess.push({x: startX, y: startY, z: startZ});
+  
+  while (toProcess.length > 0 && blocksProcessed < maxBlocks) {
+    var current = toProcess.shift();
+    var key = current.x + ',' + current.y + ',' + current.z;
+    
+    // Skip if already visited
+    if (visited.has(key)) continue;
+    visited.add(key);
+    
+    // Check if this block exists and is a sail block
+    var shipPos = new BlockPos(Math.floor(current.x), Math.floor(current.y), Math.floor(current.z));
+    var blockState = level.getBlockState(shipPos);
+    
+    // Skip air and non-sail blocks
+    if (blockState.isAir() || !_isSailBlock(blockState)) {
+      continue;
+    }
+    
+    // Process this sail block
+    if (_makeBlockFallShipSpace(level, current.x, current.y, current.z, ship)) {
+      blocksProcessed++;
+      
+      // Add adjacent blocks to the flood fill queue (26-directional including diagonals)
+      var adjacent = [];
+      for (var dx = -1; dx <= 1; dx++) {
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dz = -1; dz <= 1; dz++) {
+            // Skip the center block (0,0,0)
+            if (dx === 0 && dy === 0 && dz === 0) continue;
+            adjacent.push({
+              x: current.x + dx,
+              y: current.y + dy,
+              z: current.z + dz
+            });
+          }
+        }
+      }
+      
+      for (var i = 0; i < adjacent.length; i++) {
+        var adjKey = adjacent[i].x + ',' + adjacent[i].y + ',' + adjacent[i].z;
+        if (!visited.has(adjKey)) {
+          toProcess.push(adjacent[i]);
+        }
+      }
+    }
+  }
+  
+  return blocksProcessed;
+}
+
+function _playSailBreakSound(st, chunkX, chunkY, chunkZ) {
+  try {
+    if (!st || !st.level) return;
+    
+    var level = st.level;
+    var SoundSource = Java.loadClass('net.minecraft.sounds.SoundSource');
+    
+    // Random pitch between 0.04 and 0.1
+    var pitch = 0.04 + Math.random() * 0.06;
+    var volume = 0.5;
+    
+    // Play sack break sound for sail decay
+    try {
+      level.playSound(null, chunkX + 0.5, chunkY + 0.5, chunkZ + 0.5, 
+                     'supplementaries:block.sack.break', 
+                     SoundSource.BLOCKS, 
+                     volume, pitch);
+    } catch (soundError) {
+      // Fallback if supplementaries sound not available
+      level.playSound(null, chunkX + 0.5, chunkY + 0.5, chunkZ + 0.5, 
+                     'minecraft:block.wool.break', 
+                     SoundSource.BLOCKS, 
+                     volume, pitch);
+    }
+    
+    logDetail('playSailBreakSound played sack break at ship-space ('+chunkX+','+chunkY+','+chunkZ+')');
+  } catch (e) {
+    logDetail('playSailBreakSound error: '+e);
+  }
 }
 
 function _isSailBlock(blockState) {
   try {
     var block = blockState.getBlock();
+    var blockId = block.getId();
     
-    // Check ITEM tag using the correct method
-    if (typeof block.asItem === 'function') {
-      var item = block.asItem();
-      if (typeof item.getDefaultInstance === 'function') {
-        var itemStack = item.getDefaultInstance();
+    // Debug: Log every block we check for now to see what's available
+    if (blockId.includes('sail')) {
+      logDetail('isSailBlock checking potential sail: '+blockId);
+    }
+    
+    // Method 0: THE CORRECT WAY - Check ITEM tag, not block tag!
+    // Based on the VS_Sails code: state.getBlock().asItem().getDefaultInstance().is(tag)
+    try {
+      if (typeof block.asItem === 'function') {
+        var item = block.asItem();
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' got item from block: '+item);
+        }
         
-        // Try KubeJS hasTag method first
-        if (typeof itemStack.hasTag === 'function') {
-          var tagVariants = ['minecraft:sail_togglers', 'sail_togglers'];
-          for (var i = 0; i < tagVariants.length; i++) {
-            try {
-              if (itemStack.hasTag(tagVariants[i])) {
-                return true;
+        if (typeof item.getDefaultInstance === 'function') {
+          var itemStack = item.getDefaultInstance();
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' got itemStack: '+itemStack);
+          }
+          
+          // Try KubeJS hasTag method first (recommended approach)
+          if (typeof itemStack.hasTag === 'function') {
+            var tagVariants = [
+              'minecraft:sail_togglers',  // Full namespace version
+              'sail_togglers'             // Short version
+            ];
+            
+            for (var i = 0; i < tagVariants.length; i++) {
+              var tagName = tagVariants[i];
+              try {
+                var hasTagResult = itemStack.hasTag(tagName);
+                if (blockId.includes('sail')) {
+                  logDetail('isSailBlock '+blockId+' itemStack.hasTag("'+tagName+'") = '+hasTagResult);
+                }
+                if (hasTagResult) {
+                  logDetail('isSailBlock FOUND sail block '+blockId+' via itemStack.hasTag("'+tagName+'") (CORRECT METHOD!)');
+                  return true;
+                }
+              } catch (tagError) {
+                if (blockId.includes('sail')) {
+                  logDetail('isSailBlock '+blockId+' itemStack.hasTag("'+tagName+'") failed: '+tagError);
+                }
               }
-            } catch (tagError) {
-              // Continue to next variant
+            }
+          }
+          
+          // Fallback to itemStack.is() method
+          if (typeof itemStack.is === 'function') {
+            var tagVariants = [
+              'minecraft:sail_togglers',  // Full namespace version
+              'sail_togglers'             // Short version
+            ];
+            
+            for (var i = 0; i < tagVariants.length; i++) {
+              var tagName = tagVariants[i];
+              try {
+                var itemIsResult = itemStack.is(tagName);
+                if (blockId.includes('sail')) {
+                  logDetail('isSailBlock '+blockId+' itemStack.is("'+tagName+'") = '+itemIsResult);
+                }
+                if (itemIsResult) {
+                  logDetail('isSailBlock FOUND sail block '+blockId+' via itemStack.is("'+tagName+'") (FALLBACK METHOD!)');
+                  return true;
+                }
+              } catch (tagError) {
+                if (blockId.includes('sail')) {
+                  logDetail('isSailBlock '+blockId+' itemStack.is("'+tagName+'") failed: '+tagError);
+                }
+              }
+            }
+          } else if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' itemStack methods - hasTag: '+typeof itemStack.hasTag+', is: '+typeof itemStack.is);
+          }
+        } else if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' item.getDefaultInstance not available, type: '+typeof item.getDefaultInstance);
+        }
+      } else if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' block.asItem not available, type: '+typeof block.asItem);
+      }
+    } catch (e0) {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' item tag check failed: '+e0);
+      }
+    }
+    
+    // Method 1: Try using KubeJS Utils for tag checking
+    try {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' Method 1: tagManager check starting...');
+      }
+      
+      // Try multiple ways to get the server
+      var server = null;
+      if (global.Utils?.server) {
+        server = global.Utils.server;
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: server from Utils = '+server);
+        }
+      } else if (global.Utils?.getServer && typeof global.Utils.getServer === 'function') {
+        server = global.Utils.getServer();
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: server from getServer() = '+server);
+        }
+      } else if (typeof Utils !== 'undefined' && Utils.server) {
+        server = Utils.server;
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: server from Utils.server = '+server);
+        }
+      }
+      
+      if (server) {
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: server available = '+server);
+        }
+        
+        // Try to access KubeJS's internal tag manager
+        var overworld = server.overworld();
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: overworld = '+overworld);
+        }
+        
+        var tagManager = overworld && overworld.getTagManager ? overworld.getTagManager() : null;
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' tagManager: tagManager = '+tagManager);
+        }
+        
+        if (tagManager) {
+          var blockTags = tagManager.getOrEmpty('minecraft:block');
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' tagManager: blockTags = '+blockTags);
+          }
+          
+          if (blockTags) {
+            var sailTag = blockTags.getTag('minecraft:sail_togglers');
+            if (blockId.includes('sail')) {
+              logDetail('isSailBlock '+blockId+' tagManager: sailTag = '+sailTag);
+            }
+            
+            if (sailTag && sailTag.contains(block)) {
+              logDetail('isSailBlock FOUND sail block '+blockId+' via KubeJS tagManager');
+              return true;
+            } else if (blockId.includes('sail')) {
+              logDetail('isSailBlock '+blockId+' tagManager check = false (tag exists: '+(sailTag != null)+')');
             }
           }
         }
-        
-        // Fallback to itemStack.is() method
-        if (typeof itemStack.is === 'function') {
-          var tagVariants = ['minecraft:sail_togglers', 'sail_togglers'];
-          for (var i = 0; i < tagVariants.length; i++) {
-            try {
-              if (itemStack.is(tagVariants[i])) {
-                return true;
-              }
-            } catch (tagError) {
-              // Continue to next variant
-            }
+      } else if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' tagManager: Utils.server not available');
+      }
+    } catch (e1) {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' tagManager check failed: '+e1);
+      }
+    }
+    
+    // Method 2: Try direct ingredient matching (KubeJS way)
+    try {
+      var ingredient = global.Ingredient ? Ingredient.of('#minecraft:sail_togglers') : null;
+      if (ingredient && typeof ingredient.test === 'function') {
+        var itemStack = block.asItem().getDefaultInstance();
+        var testResult = ingredient.test(itemStack);
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' Ingredient.of("#minecraft:sail_togglers").test() = '+testResult);
+        }
+        if (testResult) {
+          logDetail('isSailBlock FOUND sail block '+blockId+' via Ingredient tag test');
+          return true;
+        }
+      } else if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' Ingredient not available or no test method');
+      }
+    } catch (e2) {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' Ingredient tag test failed: '+e2);
+      }
+    }
+    
+    // Method 3: Try blockState.is() with multiple possible tag names
+    var possibleTags = [
+      'minecraft:sail_togglers',
+      'create:windmill_sails', 
+      'vs_sails:sails',
+      'valkyrienskies:sail_togglers',
+      'vs:sail_togglers'
+    ];
+    
+    for (var i = 0; i < possibleTags.length; i++) {
+      var tagName = possibleTags[i];
+      try {
+        if (typeof blockState.is === 'function') {
+          var isResult = blockState.is(tagName);
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' blockState.is("'+tagName+'") = '+isResult);
           }
+          if (isResult) {
+            logDetail('isSailBlock FOUND sail block '+blockId+' via blockState.is("'+tagName+'")');
+            return true;
+          }
+        }
+      } catch (e3) {
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' blockState.is("'+tagName+'") failed: '+e3);
         }
       }
     }
+    
+    // Method 4: Try direct registry access with proper ResourceLocation
+    try {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' Method 4: direct registry check starting...');
+      }
+      
+      // Try multiple ways to get the server
+      var server = null;
+      if (global.Utils?.server) {
+        server = global.Utils.server;
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' registry: server from Utils = '+server);
+        }
+      } else if (global.Utils?.getServer && typeof global.Utils.getServer === 'function') {
+        server = global.Utils.getServer();
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' registry: server from getServer() = '+server);
+        }
+      } else if (typeof Utils !== 'undefined' && Utils.server) {
+        server = Utils.server;
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' registry: server from Utils.server = '+server);
+        }
+      }
+      
+      if (server) {
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' registry: server available = '+server);
+        }
+        
+        var registryAccess = server.registryAccess();
+        if (blockId.includes('sail')) {
+          logDetail('isSailBlock '+blockId+' registry: registryAccess = '+registryAccess);
+        }
+        
+        if (registryAccess) {
+          // Get the block registry and the tag directly
+          var Registries = Java.loadClass('net.minecraft.core.registries.Registries');
+          var ResourceLocation = Java.loadClass('net.minecraft.resources.ResourceLocation');
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' registry: Java classes loaded');
+          }
+          
+          var blockRegistry = registryAccess.registryOrThrow(Registries.BLOCK);
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' registry: blockRegistry = '+blockRegistry);
+          }
+          
+          var tagKey = Java.loadClass('net.minecraft.tags.TagKey').create(Registries.BLOCK, new ResourceLocation('minecraft', 'sail_togglers'));
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' registry: tagKey = '+tagKey);
+          }
+          
+          var tagOptional = blockRegistry.getTag(tagKey);
+          if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' registry: tagOptional = '+tagOptional+' present='+tagOptional.isPresent());
+          }
+          
+          if (tagOptional.isPresent()) {
+            var tag = tagOptional.get();
+            var blockHolder = blockRegistry.wrapAsHolder(block);
+            var isInTag = tag.contains(blockHolder);
+            
+            if (blockId.includes('sail')) {
+              logDetail('isSailBlock '+blockId+' direct registry tag check = '+isInTag);
+            }
+            
+            if (isInTag) {
+              logDetail('isSailBlock FOUND sail block '+blockId+' via direct registry tag check');
+              return true;
+            }
+          } else if (blockId.includes('sail')) {
+            logDetail('isSailBlock '+blockId+' sail_togglers tag not found in registry');
+            
+            // Debug: List ALL available tags to find the sail tag
+            try {
+              var allTags = blockRegistry.getTags();
+              var tagCount = 0;
+              var allTagsList = [];
+              var sailRelatedTags = [];
+              
+              var tagIterator = allTags.iterator();
+              while (tagIterator.hasNext()) {
+                var tagEntry = tagIterator.next();
+                var tagKey = tagEntry.getFirst();
+                var tagKeyStr = tagKey.toString();
+                
+                allTagsList.push(tagKeyStr);
+                
+                // Look for sail, toggle, vs_sails, or any blocks that might contain our blocks
+                if (tagKeyStr.toLowerCase().includes('sail') || 
+                    tagKeyStr.toLowerCase().includes('toggle') || 
+                    tagKeyStr.includes('vs_sails') ||
+                    tagKeyStr.includes('vs:') ||
+                    tagKeyStr.includes('valkyrien')) {
+                  sailRelatedTags.push(tagKeyStr);
+                }
+                tagCount++;
+              }
+              
+              logDetail('isSailBlock '+blockId+' registry has '+tagCount+' total tags');
+              if (sailRelatedTags.length > 0) {
+                logDetail('isSailBlock '+blockId+' sail-related tags: ['+sailRelatedTags.join(', ')+']');
+              } else {
+                logDetail('isSailBlock '+blockId+' NO sail-related tags found');
+                // Show first 10 and last 10 tags as examples
+                var sampleTags = allTagsList.slice(0, 10).concat(['...'], allTagsList.slice(-10));
+                logDetail('isSailBlock '+blockId+' sample tags: ['+sampleTags.join(', ')+']');
+              }
+            } catch (listError) {
+              logDetail('isSailBlock '+blockId+' tag listing failed: '+listError);
+            }
+          }
+        }
+      } else if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' registry: Utils.server not available');
+      }
+    } catch (e4) {
+      if (blockId.includes('sail')) {
+        logDetail('isSailBlock '+blockId+' direct registry check failed: '+e4);
+      }
+    }
+    
+    // Debug: log some block info occasionally
+    if (Math.random() < 0.05 || blockId.includes('sail')) { // Log 5% or all sail-related blocks
+      logDetail('isSailBlock checked '+blockId+' (not tagged as sail)');
+    }
+    
+    return false;
   } catch (e) {
-    // Silent fail - not a sail block
+    logDetail('isSailBlock error checking '+blockState+': '+e);
+    return false;
   }
-  
-  return false;
 }
 
 function _processDecay(st) {
   if (!st.decaying || !st.ship || !st.level) return false;
   
   var bounds = st.decayBounds;
-  var currentTime = Date.now();
-  var CFG = global.Ships_CFG;
+  var currentTick = global.Ships_tickCounter();
   
-  // Calculate timing based on progress
-  var progress = st.decayChunkCount / CFG.DECAY_ACCELERATION;
-  if (progress > 1) progress = 1;
-  var currentDelay = CFG.DECAY_START_TICKS - (CFG.DECAY_START_TICKS - CFG.DECAY_END_TICKS) * progress;
-  var delayMs = currentDelay * 50; // Convert ticks to milliseconds
+  // Calculate progressive speed based on chunk count: start slow, get faster
+  var accelerationChunks = (global.Ships_CFG && global.Ships_CFG.DECAY_ACCELERATION) || 50; // Reach max speed after 50 chunks
+  var progress = Math.min(st.decayChunkCount / accelerationChunks, 1.0); // 0.0 to 1.0
   
-  if (currentTime - st.decayLastBlockTime < delayMs) {
+  var startTicks = (global.Ships_CFG && global.Ships_CFG.DECAY_START_TICKS) || 60; // 3 seconds
+  var endTicks = (global.Ships_CFG && global.Ships_CFG.DECAY_END_TICKS) || 20; // 1 second
+  var ticksPerBlock = Math.floor(startTicks - (startTicks - endTicks) * progress);
+  
+  // Ensure decay state is properly initialized (for ships that were decaying before the update)
+  if (st.decayLayerPositions === undefined || st.decayLayerIndex === undefined || st.decayLastBlockTime === undefined || st.decayBounds === undefined || st.decayChunkCount === undefined) {
+    logTrack('processDecay ship='+st.id+' fixing incomplete decay state - rescanning bounds');
+    st.decayBounds = _findActualShipBounds(st.ship, st.level);
+    bounds = st.decayBounds;
+    st.decayCurrentY = bounds.minY;
+    st.decayLayerPositions = [];
+    st.decayLayerIndex = 0;
+    st.decayLastBlockTime = 0;
+    st.decayChunkCount = st.decayChunkCount || 0; // Keep existing count if available
+    _generateShuffledLayer(st);
+  }
+  
+  // Check if enough time has passed since last block
+  if (currentTick - st.decayLastBlockTime < ticksPerBlock) {
     return false; // Not time yet
   }
   
-  // Save current ship center position for final barrel collection
-  try {
-    if (global.KubeVS && global.KubeVS.shipCenterWorld && st.ship) {
-      var currentCenter = global.KubeVS.shipCenterWorld(st.ship);
-      if (currentCenter) {
-        st.lastSavedCenter = {
-          x: currentCenter.x,
-          y: currentCenter.y,
-          z: currentCenter.z
-        };
+  // Loop through shuffled positions until we find a block or reach the end
+  var attempts = 0;
+  var maxAttempts = 200; // Prevent infinite loops, process up to 200 air blocks per tick
+  
+  while (attempts < maxAttempts) {
+    // Check if we've processed all layers
+    if (st.decayCurrentY > bounds.maxY) {
+      logTrack('processDecay ship='+st.id+' completed, removing ship');
+      _completeDecay(st);
+      return true; // Signal that ship should be removed
+    }
+    
+    // Check if we need to move to next layer
+    if (st.decayLayerIndex >= st.decayLayerPositions.length) {
+      st.decayCurrentY++;
+      if (st.decayCurrentY > bounds.maxY) {
+        logTrack('processDecay ship='+st.id+' completed, removing ship');
+        _completeDecay(st);
+        return true;
+      }
+      _generateShuffledLayer(st);
+      logTrack('processDecay ship='+st.id+' moving to next layer Y='+st.decayCurrentY+' with '+st.decayLayerPositions.length+' positions, speed='+ticksPerBlock+' ticks');
+    }
+    
+    // Get current position from shuffled layer
+    var pos = st.decayLayerPositions[st.decayLayerIndex];
+    logTrack('processDecay ship='+st.id+' tick='+currentTick+' processing Y='+st.decayCurrentY+' X='+pos.x+' Z='+pos.z+' ('+st.decayLayerIndex+'/'+(st.decayLayerPositions.length-1)+')');
+    
+    // Calculate progressive floodfill size based on chunk count: start small, get bigger
+    var accelerationChunks = (global.Ships_CFG && global.Ships_CFG.DECAY_ACCELERATION) || 50; // Reach max size after 50 chunks
+    var progress = Math.min(st.decayChunkCount / accelerationChunks, 1.0); // 0.0 to 1.0
+    
+    var CFG = global.Ships_CFG;
+    var startSize = CFG.DECAY_FLOODFILL_START;
+    var endSize = CFG.DECAY_FLOODFILL_END;
+    var floodFillSize = Math.floor(startSize + (endSize - startSize) * progress);
+    
+    // Every 20 chunks, create barrel ships from nearby dropped items using last saved center
+    if (st.decayChunkCount > 0 && st.decayChunkCount % 20 === 0 && st.lastSavedCenter) {
+      logTrack('processDecay ship='+st.id+' chunk '+st.decayChunkCount+' triggering periodic barrel collection');
+      _createFinalBarrelCollection(st.level, st.lastSavedCenter.x, st.lastSavedCenter.y, st.lastSavedCenter.z, st.id + '_chunk' + st.decayChunkCount);
+    }
+    
+    // Try to process current position with progressive floodfill
+    var blocksProcessed = _processBlockClump(st.level, pos.x, st.decayCurrentY, pos.z, st.ship, floodFillSize);
+    
+      if (blocksProcessed > 0) {
+        // Found and processed blocks - wait before next clump
+        st.decayProgress += blocksProcessed;
+        st.decayChunkCount++; // Increment chunk counter for acceleration
+        st.decayLastBlockTime = currentTick;
+        
+        // Save current ship center position for final barrel collection
+        try {
+          if (global.KubeVS && global.KubeVS.shipCenterWorld && st.ship) {
+            var currentCenter = global.KubeVS.shipCenterWorld(st.ship);
+            if (currentCenter) {
+              st.lastSavedCenter = {
+                x: currentCenter.x,
+                y: currentCenter.y,
+                z: currentCenter.z
+              };
+              logDetail('processDecay ship='+st.id+' saved center position: ('+currentCenter.x.toFixed(1)+','+currentCenter.y.toFixed(1)+','+currentCenter.z.toFixed(1)+')');
+            }
+          }
+        } catch (centerErr) {
+          logDetail('processDecay ship='+st.id+' failed to save center position: '+centerErr);
+        }
+        
+        logTrack('processDecay ship='+st.id+' chunk '+st.decayChunkCount+' processed '+blocksProcessed+' blocks at ('+pos.x+','+st.decayCurrentY+','+pos.z+') speed='+ticksPerBlock+' ticks floodfill='+floodFillSize+' blocks');
+
+        // Play chunk break sound effect
+        _playChunkBreakSound(st, pos.x, st.decayCurrentY, pos.z);
+
+        // Advance to next position in layer
+        st.decayLayerIndex++;
+        return false; // Wait for next tick with progressive delay
+      } else {
+      // No blocks found - advance position and try again immediately
+      st.decayLayerIndex++;
+      attempts++;
+      // Continue loop to try next position immediately
+    }
+  }
+  
+  // If we hit max attempts, we'll try again next tick
+  return false;
+}
+
+function _processBlockClump(level, centerX, centerY, centerZ, ship, floodFillSize) {
+  // Use floodfill to spread from the center point to adjacent solid blocks
+  var blocksProcessed = _floodFillDecay(level, centerX, centerY, centerZ, ship, floodFillSize);
+  
+  logDetail('processBlockClump center('+centerX+','+centerY+','+centerZ+') floodfill processed '+blocksProcessed+'/'+floodFillSize+' blocks');
+  return blocksProcessed;
+}
+
+function _floodFillDecay(level, startX, startY, startZ, ship, maxBlocks) {
+  var visited = new Set();
+  var toProcess = [];
+  var blocksProcessed = 0;
+  
+  // Start with the initial position
+  toProcess.push({x: startX, y: startY, z: startZ});
+  
+  while (toProcess.length > 0 && blocksProcessed < maxBlocks) {
+    var current = toProcess.shift();
+    var key = current.x + ',' + current.y + ',' + current.z;
+    
+    // Skip if already visited
+    if (visited.has(key)) continue;
+    visited.add(key);
+    
+    // Check if this block exists and can be made to fall
+    var shipPos = new BlockPos(Math.floor(current.x), Math.floor(current.y), Math.floor(current.z));
+    var blockState = level.getBlockState(shipPos);
+    
+    // Skip air and already-falling blocks
+    if (blockState.isAir() || blockState.getBlock().toString().includes('falling')) {
+      continue;
+    }
+    
+    // Process this block
+    if (_makeBlockFallShipSpace(level, current.x, current.y, current.z, ship)) {
+      blocksProcessed++;
+      
+      // Add adjacent blocks to the flood fill queue (26-directional including diagonals)
+      var adjacent = [];
+      for (var dx = -1; dx <= 1; dx++) {
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dz = -1; dz <= 1; dz++) {
+            // Skip the center block (0,0,0)
+            if (dx === 0 && dy === 0 && dz === 0) continue;
+            adjacent.push({
+              x: current.x + dx,
+              y: current.y + dy,
+              z: current.z + dz
+            });
+          }
+        }
+      }
+      
+      for (var i = 0; i < adjacent.length; i++) {
+        var adjKey = adjacent[i].x + ',' + adjacent[i].y + ',' + adjacent[i].z;
+        if (!visited.has(adjKey)) {
+          toProcess.push(adjacent[i]);
+        }
       }
     }
-  } catch (centerErr) {
-    logDetail('processDecay ship='+st.id+' failed to save center position: '+centerErr);
   }
   
-  // Check if we need to trigger barrel collection (every 20 chunks)
-  var startSize = CFG.DECAY_FLOODFILL_START;
-  var endSize = CFG.DECAY_FLOODFILL_END;
-  var floodFillSize = Math.floor(startSize + (endSize - startSize) * progress);
+  return blocksProcessed;
+}
+
+function _generateShuffledLayer(st) {
+  var bounds = st.decayBounds;
+  st.decayLayerPositions = [];
+  st.decayLayerIndex = 0;
   
-  // Every 20 chunks, create barrel ships from nearby dropped items using last saved center
-  if (st.decayChunkCount > 0 && st.decayChunkCount % 20 === 0 && st.lastSavedCenter) {
-    logTrack('processDecay ship='+st.id+' chunk '+st.decayChunkCount+' triggering periodic barrel collection');
-    _createFinalBarrelCollection(st.level, st.lastSavedCenter.x, st.lastSavedCenter.y, st.lastSavedCenter.z, st.id + '_chunk' + st.decayChunkCount);
+  // Generate all X,Z positions for current Y layer
+  for (var x = bounds.minX; x <= bounds.maxX; x++) {
+    for (var z = bounds.minZ; z <= bounds.maxZ; z++) {
+      st.decayLayerPositions.push({ x: x, z: z });
+    }
   }
   
-  // Process current layer
-  if (st.decayLayerPositions.length === 0) {
-    // Generate new layer
-    if (st.decayCurrentY > bounds.maxY) {
-      // Finished all layers
-      _completeDecay(st);
+  // Shuffle the positions using Fisher-Yates algorithm
+  for (var i = st.decayLayerPositions.length - 1; i > 0; i--) {
+    var j = Math.floor(Math.random() * (i + 1));
+    var temp = st.decayLayerPositions[i];
+    st.decayLayerPositions[i] = st.decayLayerPositions[j];
+    st.decayLayerPositions[j] = temp;
+  }
+  
+  logDetail('generateShuffledLayer Y='+st.decayCurrentY+' generated '+st.decayLayerPositions.length+' shuffled positions');
+}
+
+function _makeBlockFallShipSpace(level, shipSpaceX, shipSpaceY, shipSpaceZ, ship) {
+  try {
+    logDetail('makeBlockFallShipSpace processing ship-space coordinates ('+shipSpaceX+','+shipSpaceY+','+shipSpaceZ+')');
+    
+    var shipPos = new BlockPos(Math.floor(shipSpaceX), Math.floor(shipSpaceY), Math.floor(shipSpaceZ));
+    
+    // Get block state at this ship-space coordinate
+    var blockState = level.getBlockState(shipPos);
+    
+    logDetail('makeBlockFallShipSpace blockState at ship-space('+Math.floor(shipSpaceX)+','+Math.floor(shipSpaceY)+','+Math.floor(shipSpaceZ)+'): '+(blockState.isAir() ? 'AIR' : blockState.getBlock()));
+    
+    // Skip air and already-falling blocks
+    if (blockState.isAir() || blockState.getBlock().toString().includes('falling')) {
+      logDetail('makeBlockFallShipSpace skipping AIR/falling block at ship-space('+Math.floor(shipSpaceX)+','+Math.floor(shipSpaceY)+','+Math.floor(shipSpaceZ)+')');
+      return false;
+    }
+    
+    // Create falling block entity at the ship space position
+    var FallingBlockEntity = Java.loadClass('net.minecraft.world.entity.item.FallingBlockEntity');
+    var fallingBlock = FallingBlockEntity.fall(level, shipPos, blockState);
+    
+    if (fallingBlock) {
+      // Add some randomness to prevent UUID collisions and make it look more natural
+      var randomOffsetX = Math.random() * 0.6 - 0.3; // Random between -0.3 and 0.3
+      var randomOffsetZ = Math.random() * 0.6 - 0.3;
+      
+      // Set position in ship space - VS2 will transform to world space automatically when added
+      // Move down by 0.5 Y to prevent immediate collision with ship
+      fallingBlock.setPos(shipSpaceX + 0.5 + randomOffsetX, shipSpaceY - 0.5, shipSpaceZ + 0.5 + randomOffsetZ);
+      
+      // Set the original block to air in ship space
+      var air = Java.loadClass('net.minecraft.world.level.block.Blocks').AIR.defaultBlockState();
+      level.setBlock(shipPos, air, 3);
+      
+      // Add the falling block to the world - VS2 handles the coordinate transformation
+      level.addFreshEntity(fallingBlock);
+      
+      logDetail('makeBlockFallShipSpace converted block at ship-space('+shipSpaceX+','+shipSpaceY+','+shipSpaceZ+') to falling block');
       return true;
     }
-    
-    // Generate positions for current Y layer
-    for (var x = bounds.minX; x <= bounds.maxX; x++) {
-      for (var z = bounds.minZ; z <= bounds.maxZ; z++) {
-        st.decayLayerPositions.push({x: x, y: st.decayCurrentY, z: z});
-      }
-    }
-    
-    // Shuffle positions for random decay within layer
-    for (var i = st.decayLayerPositions.length - 1; i > 0; i--) {
-      var j = Math.floor(Math.random() * (i + 1));
-      var temp = st.decayLayerPositions[i];
-      st.decayLayerPositions[i] = st.decayLayerPositions[j];
-      st.decayLayerPositions[j] = temp;
-    }
-    
-    st.decayLayerIndex = 0;
-    st.decayCurrentY++;
-  }
-  
-  // Process blocks in current layer using floodfill
-  if (st.decayLayerIndex < st.decayLayerPositions.length) {
-    var pos = st.decayLayerPositions[st.decayLayerIndex];
-    st.decayLayerIndex++;
-    
-    var blocksProcessed = _processBlockClump(st.level, pos.x, pos.y, pos.z, st.ship, floodFillSize);
-    
-    if (blocksProcessed > 0) {
-      st.decayProgress += blocksProcessed;
-      st.decayLastBlockTime = currentTime;
-      st.decayChunkCount++;
-      
-      // Play sound effect
-      try {
-        st.level.playSound(null, pos.x, pos.y, pos.z, 'minecraft:entity.zombie.attack_wooden_door', 'blocks', 0.3, 0.1 + Math.random() * 0.3);
-      } catch (soundErr) {
-        // Sound failed, continue
-      }
-    }
-    
-    // If we've processed all positions in this layer, move to next layer
-    if (st.decayLayerIndex >= st.decayLayerPositions.length) {
-      st.decayLayerPositions = [];
-    }
+  } catch(e) {
+    logDetail('makeBlockFallShipSpace error at ship-space('+shipSpaceX+','+shipSpaceY+','+shipSpaceZ+'): '+e);
   }
   
   return false;
 }
 
-function _processBlockClump(level, startX, startY, startZ, ship, maxBlocks) {
-  var processed = 0;
-  var toProcess = [{x: startX, y: startY, z: startZ}];
-  var visited = new Set();
-  
-  while (toProcess.length > 0 && processed < maxBlocks) {
-    var pos = toProcess.shift();
-    var key = pos.x + ',' + pos.y + ',' + pos.z;
-    
-    if (visited.has(key)) continue;
-    visited.add(key);
-    
-    var BlockPos = Java.loadClass('net.minecraft.core.BlockPos');
-    var blockPos = new BlockPos(pos.x, pos.y, pos.z);
-    var blockState = level.getBlockState(blockPos);
-    
-    if (blockState.isAir()) continue;
-    
-    // Convert to falling block
-    try {
-      var FallingBlockEntity = Java.loadClass('net.minecraft.world.entity.item.FallingBlockEntity');
-      var fallingBlock = FallingBlockEntity.fall(level, blockPos, blockState);
-      if (fallingBlock) {
-        // Offset slightly to avoid collision
-        fallingBlock.setPos(pos.x + 0.5, pos.y - 0.5, pos.z + 0.5);
-        level.addFreshEntity(fallingBlock);
-        
-        // Remove original block
-        level.setBlock(blockPos, level.getBlockState(new BlockPos(0, -64, 0)).getBlock().defaultBlockState(), 3);
-        processed++;
-      }
-    } catch (e) {
-      logDetail('processBlockClump error at ('+pos.x+','+pos.y+','+pos.z+'): '+e);
+function _playChunkBreakSound(st, chunkX, chunkY, chunkZ) {
+  try {
+    if (!st || !st.level) {
+      logDetail('playChunkBreakSound missing requirements: st='+!!st+' level='+!!st?.level);
+      return;
     }
     
-    // Add adjacent blocks (26-directional floodfill)
-    for (var dx = -1; dx <= 1; dx++) {
-      for (var dy = -1; dy <= 1; dy++) {
-        for (var dz = -1; dz <= 1; dz++) {
-          if (dx === 0 && dy === 0 && dz === 0) continue;
-          var newPos = {x: pos.x + dx, y: pos.y + dy, z: pos.z + dz};
-          var newKey = newPos.x + ',' + newPos.y + ',' + newPos.z;
-          if (!visited.has(newKey)) {
-            toProcess.push(newPos);
-          }
-        }
-      }
-    }
-  }
-  
-  return processed;
-}
-
-function _processSailDecay(st) {
-  if (!st.sailDecayActive || !st.ship || !st.level) return;
-  
-  var currentTime = Date.now();
-  var sailDecayInterval = 1000; // 1 second
-  
-  if (currentTime - st.sailDecayLastTime < sailDecayInterval) {
-    return; // Not time yet
-  }
-  
-  st.sailDecayLastTime = currentTime;
-  
-  // Find a random sail block and decay it
-  var bounds = st.decayBounds;
-  var attempts = 0;
-  var maxAttempts = 50;
-  
-  while (attempts < maxAttempts) {
-    var x = bounds.minX + Math.floor(Math.random() * (bounds.maxX - bounds.minX + 1));
-    var y = bounds.minY + Math.floor(Math.random() * (bounds.maxY - bounds.minY + 1));
-    var z = bounds.minZ + Math.floor(Math.random() * (bounds.maxZ - bounds.minZ + 1));
+    var level = st.level;
+    var SoundEvents = Java.loadClass('net.minecraft.sounds.SoundEvents');
+    var SoundSource = Java.loadClass('net.minecraft.sounds.SoundSource');
     
-    var BlockPos = Java.loadClass('net.minecraft.core.BlockPos');
-    var blockPos = new BlockPos(x, y, z);
-    var blockState = st.level.getBlockState(blockPos);
+    // Random pitch between 0.04 and 0.1
+    var pitch = 0.04 + Math.random() * 0.06; // 0.04 to 0.1
+    var volume = 0.5; // Moderate volume
     
-    if (!blockState.isAir() && _isSailBlock(blockState)) {
-      // Found a sail block, start floodfill decay
-      var CFG = global.Ships_CFG;
-      var processed = _floodFillSailDecay(st.level, x, y, z, st.ship, CFG.SAIL_FLOODFILL_SIZE);
-      
-      if (processed > 0) {
-        // Play sail decay sound
-        try {
-          st.level.playSound(null, x, y, z, 'supplementaries:block.sack.break', 'blocks', 0.5, 0.8 + Math.random() * 0.4);
-        } catch (soundErr) {
-          // Sound failed, continue
-        }
-      }
-      break;
-    }
-    attempts++;
+    // Play sound at ship-space coordinates - VS2 handles the transformation automatically!
+    level.playSound(null, chunkX + 0.5, chunkY + 0.5, chunkZ + 0.5, 
+                   SoundEvents.ZOMBIE_ATTACK_WOODEN_DOOR, 
+                   SoundSource.BLOCKS, 
+                   volume, pitch);
+    
+    logDetail('playChunkBreakSound played at ship-space ('+chunkX+','+chunkY+','+chunkZ+') volume='+volume+' pitch='+pitch.toFixed(3));
+  } catch (e) {
+    logDetail('playChunkBreakSound error: '+e);
   }
 }
 
-function _floodFillSailDecay(level, startX, startY, startZ, ship, maxBlocks) {
-  var processed = 0;
-  var toProcess = [{x: startX, y: startY, z: startZ}];
-  var visited = new Set();
+
+
+
+
+
+function _createPeriodicBarrelShips(st, chunkX, chunkY, chunkZ) {
+  if (!st || !st.level || !st.ship) return;
   
-  while (toProcess.length > 0 && processed < maxBlocks) {
-    var pos = toProcess.shift();
-    var key = pos.x + ',' + pos.y + ',' + pos.z;
-    
-    if (visited.has(key)) continue;
-    visited.add(key);
-    
-    var BlockPos = Java.loadClass('net.minecraft.core.BlockPos');
-    var blockPos = new BlockPos(pos.x, pos.y, pos.z);
-    var blockState = level.getBlockState(blockPos);
-    
-    if (blockState.isAir() || !_isSailBlock(blockState)) continue;
-    
-    // Convert sail block to falling block
-    try {
-      var FallingBlockEntity = Java.loadClass('net.minecraft.world.entity.item.FallingBlockEntity');
-      var fallingBlock = FallingBlockEntity.fall(level, blockPos, blockState);
-      if (fallingBlock) {
-        fallingBlock.setPos(pos.x + 0.5, pos.y - 0.5, pos.z + 0.5);
-        level.addFreshEntity(fallingBlock);
-        
-        // Remove original block
-        level.setBlock(blockPos, level.getBlockState(new BlockPos(0, -64, 0)).getBlock().defaultBlockState(), 3);
-        processed++;
-      }
-    } catch (e) {
-      logDetail('floodFillSailDecay error at ('+pos.x+','+pos.y+','+pos.z+'): '+e);
-    }
-    
-    // Add adjacent blocks (26-directional floodfill)
-    for (var dx = -1; dx <= 1; dx++) {
-      for (var dy = -1; dy <= 1; dy++) {
-        for (var dz = -1; dz <= 1; dz++) {
-          if (dx === 0 && dy === 0 && dz === 0) continue;
-          var newPos = {x: pos.x + dx, y: pos.y + dy, z: pos.z + dz};
-          var newKey = newPos.x + ',' + newPos.y + ',' + newPos.z;
-          if (!visited.has(newKey)) {
-            toProcess.push(newPos);
-          }
-        }
-      }
+  var level = st.level;
+  
+  // Convert ship-space coordinates to world coordinates for the processed chunk
+  var worldPos = null;
+  if (global.KubeVS && global.KubeVS.shipToWorldVec) {
+    worldPos = global.KubeVS.shipToWorldVec(st.ship, chunkX, chunkY, chunkZ);
+  }
+  
+  if (!worldPos) {
+    // Fallback to ship center if conversion fails
+    if (st.ship && global.KubeVS && global.KubeVS.shipCenterWorld) {
+      worldPos = global.KubeVS.shipCenterWorld(st.ship);
+    } else if (st.lastCenter) {
+      worldPos = st.lastCenter;
     }
   }
   
-  return processed;
-}
-
-function _completeDecay(st) {
-  if (!st) return;
-  
-  st.decaying = false;
-  st.decayCompleted = true;
-  
-  logTrack('completeDecay ship='+st.id+' finished, processed '+st.decayProgress+' blocks in '+st.decayChunkCount+' chunks');
-  
-  // Do final barrel collection using last saved center position
-  if (st.lastSavedCenter && st.level) {
-    logTrack('completeDecay ship='+st.id+' performing final barrel collection at last saved center ('+st.lastSavedCenter.x.toFixed(1)+','+st.lastSavedCenter.y.toFixed(1)+','+st.lastSavedCenter.z.toFixed(1)+')');
-    _createFinalBarrelCollection(st.level, st.lastSavedCenter.x, st.lastSavedCenter.y, st.lastSavedCenter.z, st.id);
-  } else {
-    logTrack('completeDecay ship='+st.id+' no saved center position available for final barrel collection');
+  if (!worldPos) {
+    logDetail('createPeriodicBarrelShips ship='+st.id+' no world position available, skipping barrel creation');
+    return;
   }
   
-  var server = st.level ? st.level.server : null;
-  if (server) {
-    Ships_broadcast(server, '§8[Ships] Ship '+st.id+' has completely collapsed into the depths... §6Salvage barrel ships are floating away!');
-  }
-}
-
-// ---------- barrel system ----------
-function _createFinalBarrelCollection(level, centerX, centerY, centerZ, shipId) {
-  if (!level) return;
+  var collectRadius = 25; // 50x50x50 area (25 blocks in each direction)
   
-  logTrack('createFinalBarrelCollection ship='+shipId+' collecting items in 100x100x100 area around ('+centerX.toFixed(1)+','+centerY.toFixed(1)+','+centerZ.toFixed(1)+')');
+  logTrack('createPeriodicBarrelShips ship='+st.id+' chunk '+st.decayChunkCount+' collecting items in 50x50x50 area around world pos ('+worldPos.x+','+worldPos.y+','+worldPos.z+')');
   
-  // Collect items in 100x100x100 area (50 block radius)
-  var collectRadius = 50;
-  var minX = centerX - collectRadius;
-  var minY = Math.max(level.getMinBuildHeight(), centerY - collectRadius);
-  var minZ = centerZ - collectRadius;
-  var maxX = centerX + collectRadius;
-  var maxY = Math.min(level.getMaxBuildHeight(), centerY + collectRadius);
-  var maxZ = centerZ + collectRadius;
+  // Create AABB for item collection around the world position of the processed chunk
+  var minX = worldPos.x - collectRadius;
+  var minY = Math.max(level.getMinBuildHeight(), worldPos.y - collectRadius);
+  var minZ = worldPos.z - collectRadius;
+  var maxX = worldPos.x + collectRadius;
+  var maxY = Math.min(level.getMaxBuildHeight(), worldPos.y + collectRadius);
+  var maxZ = worldPos.z + collectRadius;
   
   var AABB = Java.loadClass('net.minecraft.world.phys.AABB');
   var collectionAABB = new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+  
+  // Find all item entities in the area
   var ItemEntityClass = Java.loadClass('net.minecraft.world.entity.item.ItemEntity');
   var itemEntities = level.getEntitiesOfClass(ItemEntityClass, collectionAABB);
   
   if (!itemEntities || itemEntities.size() === 0) {
-    logTrack('createFinalBarrelCollection ship='+shipId+' no items found in collection area');
+    logDetail('createPeriodicBarrelShips ship='+st.id+' no items found in collection area');
     return;
   }
   
-  logTrack('createFinalBarrelCollection ship='+shipId+' found '+itemEntities.size()+' dropped items');
+  logTrack('createPeriodicBarrelShips ship='+st.id+' found '+itemEntities.size()+' dropped items');
   
   // Collect all items
   var allItems = [];
@@ -570,33 +1320,40 @@ function _createFinalBarrelCollection(level, centerX, centerY, centerZ, shipId) 
   while (iterator.hasNext()) {
     var itemEntity = iterator.next();
     var itemStack = itemEntity.getItem();
+    
     if (itemStack && !itemStack.isEmpty()) {
       allItems.push(itemStack.copy());
-      itemEntity.discard(); // Remove the item entity
+      itemEntity.discard(); // Remove from world
     }
   }
   
   if (allItems.length === 0) {
-    logTrack('createFinalBarrelCollection ship='+shipId+' no valid items collected');
+    logTrack('createPeriodicBarrelShips ship='+st.id+' no valid items collected');
     return;
   }
   
-  // Create barrel ships with collected items
-  var itemsPerBarrel = 27; // Standard barrel capacity
+  // Group items into barrel-sized chunks (27 items per barrel)
+  var itemsPerBarrel = 27;
   var barrelCount = 0;
-  var spreadRadius = 25; // Spread barrels over 50x50 area
+  
+  // Create barrel ships spread out around the collection center
+  var spreadRadius = 15; // Spread barrels over 30x30 area around collection point
   var startIndex = 0;
   
   while (startIndex < allItems.length) {
     var barrelItems = allItems.slice(startIndex, startIndex + itemsPerBarrel);
-    var barrelPos = _findSpreadPosition(level, centerX, centerY, centerZ, barrelCount, spreadRadius);
-    _createBarrelShip(level, barrelPos.x, barrelPos.y, barrelPos.z, barrelItems, shipId + '_final_' + barrelCount);
+    
+    // Find spread out position for this barrel ship around the world position
+    var barrelPos = _findSpreadPosition(level, worldPos.x, worldPos.y, worldPos.z, barrelCount, spreadRadius);
+    _createBarrelShip(level, barrelPos.x, barrelPos.y, barrelPos.z, barrelItems, st.decayChunkCount + '_' + barrelCount);
+    
     barrelCount++;
     startIndex += itemsPerBarrel;
   }
   
-  logTrack('createFinalBarrelCollection ship='+shipId+' created '+barrelCount+' final barrel ships with '+allItems.length+' total items');
+  logTrack('createPeriodicBarrelShips ship='+st.id+' created '+barrelCount+' barrel ships with '+allItems.length+' total items at chunk '+st.decayChunkCount);
 }
+
 
 function _findSpreadPosition(level, centerX, centerY, centerZ, barrelIndex, spreadRadius) {
   // Create a more spread out distribution using a spiral pattern
@@ -641,6 +1398,8 @@ function _findSpreadPosition(level, centerX, centerY, centerZ, barrelIndex, spre
     targetY = Math.min(50, centerY - 10); // Default deep position
   }
   
+  logDetail('findSpreadPosition barrel #' + barrelIndex + ' at (' + targetX + ',' + targetY + ',' + targetZ + ') foundWater=' + foundWater);
+  
   return {
     x: targetX,
     y: targetY,
@@ -675,10 +1434,15 @@ function _createBarrelShip(level, x, y, z, items, barrelNumber) {
       // Set the FACING property to random direction
       if (barrelState.hasProperty && barrelState.hasProperty(BlockStateProperties.FACING)) {
         barrelState = barrelState.setValue(BlockStateProperties.FACING, randomDirection);
+        logDetail('createBarrelShip applied random rotation: facing=' + randomDirection);
+      } else {
+        logDetail('createBarrelShip barrel does not have FACING property');
       }
     } catch (rotationError) {
-      // Use default orientation
+      logDetail('createBarrelShip blockstate rotation failed: ' + rotationError + ' - using default orientation');
     }
+    
+    logDetail('createBarrelShip placing barrel ship #'+barrelNumber+' at ('+x+','+y+','+z+') with '+items.length+' items');
     
     // First, place the barrel block with rotation
     level.setBlock(barrelPos, barrelState, 3);
@@ -690,6 +1454,7 @@ function _createBarrelShip(level, x, y, z, items, barrelNumber) {
         blockEntity.setItem(i, items[i]);
       }
       blockEntity.setChanged();
+      logDetail('createBarrelShip filled barrel with '+items.length+' items');
     }
     
     // Attempt to convert the barrel block into a Valkyrien Skies ship
@@ -708,7 +1473,12 @@ function _createBarrelShip(level, x, y, z, items, barrelNumber) {
             createTime: Date.now(),
             barrelNumber: barrelNumber
           };
+          logDetail('createBarrelShip tracked barrel ' + barrelId + ' for cleanup');
+        } else {
+          logDetail('createBarrelShip KubeVS.createShip returned null for barrel #'+barrelNumber+' - continuing investigation');
         }
+      } else {
+        logDetail('createBarrelShip KubeVS.createShip not available');
       }
     } catch (shipError) {
       logDetail('createBarrelShip ship creation failed for barrel #'+barrelNumber+': '+shipError);
@@ -719,7 +1489,89 @@ function _createBarrelShip(level, x, y, z, items, barrelNumber) {
   }
 }
 
-// ---------- barrel cleanup ----------
+
+function _completeDecay(st) {
+  if (!st) return;
+  
+  st.decaying = false;
+  st.decayCompleted = true;
+  
+  logTrack('completeDecay ship='+st.id+' finished, processed '+st.decayProgress+' blocks in '+st.decayChunkCount+' chunks');
+  
+  // Do final barrel collection using last saved center position
+  if (st.lastSavedCenter && st.level) {
+    logTrack('completeDecay ship='+st.id+' performing final barrel collection at last saved center ('+st.lastSavedCenter.x.toFixed(1)+','+st.lastSavedCenter.y.toFixed(1)+','+st.lastSavedCenter.z.toFixed(1)+')');
+    _createFinalBarrelCollection(st.level, st.lastSavedCenter.x, st.lastSavedCenter.y, st.lastSavedCenter.z, st.id);
+  } else {
+    logTrack('completeDecay ship='+st.id+' no saved center position available for final barrel collection');
+  }
+  
+  var server = st.level ? st.level.server : null;
+  if (server) {
+    Ships_broadcast(server, '§8[Ships] Ship '+st.id+' has completely collapsed into the depths... §6Salvage barrel ships are floating away!');
+  }
+}
+
+function _createFinalBarrelCollection(level, centerX, centerY, centerZ, shipId) {
+  if (!level) return;
+  
+  logTrack('createFinalBarrelCollection ship='+shipId+' collecting items in 100x100x100 area around ('+centerX.toFixed(1)+','+centerY.toFixed(1)+','+centerZ.toFixed(1)+')');
+  
+  // Collect items in 100x100x100 area (50 block radius)
+  var collectRadius = 50;
+  var minX = centerX - collectRadius;
+  var minY = Math.max(level.getMinBuildHeight(), centerY - collectRadius);
+  var minZ = centerZ - collectRadius;
+  var maxX = centerX + collectRadius;
+  var maxY = Math.min(level.getMaxBuildHeight(), centerY + collectRadius);
+  var maxZ = centerZ + collectRadius;
+  
+  var AABB = Java.loadClass('net.minecraft.world.phys.AABB');
+  var collectionAABB = new AABB(minX, minY, minZ, maxX, maxY, maxZ);
+  var ItemEntityClass = Java.loadClass('net.minecraft.world.entity.item.ItemEntity');
+  var itemEntities = level.getEntitiesOfClass(ItemEntityClass, collectionAABB);
+  
+  if (!itemEntities || itemEntities.size() === 0) {
+    logTrack('createFinalBarrelCollection ship='+shipId+' no items found in collection area');
+    return;
+  }
+  
+  logTrack('createFinalBarrelCollection ship='+shipId+' found '+itemEntities.size()+' dropped items');
+  
+  // Collect all items
+  var allItems = [];
+  var iterator = itemEntities.iterator();
+  while (iterator.hasNext()) {
+    var itemEntity = iterator.next();
+    var itemStack = itemEntity.getItem();
+    if (itemStack && !itemStack.isEmpty()) {
+      allItems.push(itemStack.copy());
+      itemEntity.discard(); // Remove the item entity
+    }
+  }
+  
+  if (allItems.length === 0) {
+    logTrack('createFinalBarrelCollection ship='+shipId+' no valid items collected');
+      return;
+    }
+  
+  // Create barrel ships with collected items
+  var itemsPerBarrel = 27; // Standard barrel capacity
+  var barrelCount = 0;
+  var spreadRadius = 25; // Spread barrels over 50x50 area
+  var startIndex = 0;
+  
+  while (startIndex < allItems.length) {
+    var barrelItems = allItems.slice(startIndex, startIndex + itemsPerBarrel);
+    var barrelPos = _findSpreadPosition(level, centerX, centerY, centerZ, barrelCount, spreadRadius);
+    _createBarrelShip(level, barrelPos.x, barrelPos.y, barrelPos.z, barrelItems, shipId + '_final_' + barrelCount);
+    barrelCount++;
+    startIndex += itemsPerBarrel;
+  }
+  
+  logTrack('createFinalBarrelCollection ship='+shipId+' created '+barrelCount+' final barrel ships with '+allItems.length+' total items');
+}
+
 function _processBarrelCleanup() {
   var CFG = global.Ships_CFG;
   if (!CFG || CFG.BARREL_DESPAWN_MINUTES <= 0) return; // Cleanup disabled
@@ -742,11 +1594,14 @@ function _processBarrelCleanup() {
         if (barrel.ship && global.KubeVS && global.KubeVS.removeShip) {
           var removed = global.KubeVS.removeShip(barrel.ship);
           if (removed) {
+            logDetail('processBarrelCleanup despawned barrel ' + barrelId + ' after ' + (age / 60000).toFixed(1) + ' minutes');
             removedCount++;
+          } else {
+            logDetail('processBarrelCleanup failed to remove barrel ship ' + barrelId);
           }
         }
       } catch (removeErr) {
-        // Continue cleanup
+        logDetail('processBarrelCleanup error removing barrel ' + barrelId + ': ' + removeErr);
       }
       
       // Remove from tracking regardless of success
@@ -779,7 +1634,7 @@ function _cleanupAllBarrels() {
         }
       }
     } catch (removeErr) {
-      // Continue cleanup
+      logDetail('cleanupAllBarrels error removing barrel ' + barrelId + ': ' + removeErr);
     }
     
     delete BARREL_TRACK[barrelId];
@@ -788,9 +1643,12 @@ function _cleanupAllBarrels() {
   logTrack('cleanupAllBarrels removed ' + removedCount + ' barrels');
 }
 
-// ---------- test functions ----------
 function _testCreateBarrelShipsAt(level, x, y, z) {
   if (!level) return;
+  
+  // Temporarily enable debug for testing
+  var oldDebug = global.Ships_CFG.DEBUG;
+  global.Ships_CFG.DEBUG = true;
   
   var collectRadius = 25; // 50x50x50 area (25 blocks in each direction)
   
@@ -812,44 +1670,197 @@ function _testCreateBarrelShipsAt(level, x, y, z) {
   var itemEntities = level.getEntitiesOfClass(ItemEntityClass, collectionAABB);
   
   if (!itemEntities || itemEntities.size() === 0) {
-    logTrack('testCreateBarrelShipsAt no items found in test area - creating test items');
+    logTrack('testCreateBarrelShipsAt no items found in collection area, creating test items');
     
-    // Create some test items
+    // Create some test items if none exist
+    var testItems = [];
     var Items = Java.loadClass('net.minecraft.world.item.Items');
     var ItemStack = Java.loadClass('net.minecraft.world.item.ItemStack');
-    var ItemEntity = Java.loadClass('net.minecraft.world.entity.item.ItemEntity');
     
-    var testItems = [
-      new ItemStack(Items.DIAMOND, 5),
-      new ItemStack(Items.GOLD_INGOT, 10),
-      new ItemStack(Items.IRON_INGOT, 20),
-      new ItemStack(Items.COAL, 32)
-    ];
+    // Create a few test item stacks
+    testItems.push(new ItemStack(Items.DIAMOND, 5));
+    testItems.push(new ItemStack(Items.GOLD_INGOT, 10));
+    testItems.push(new ItemStack(Items.IRON_INGOT, 15));
+    testItems.push(new ItemStack(Items.OAK_PLANKS, 32));
+    testItems.push(new ItemStack(Items.BREAD, 8));
     
-    for (var i = 0; i < testItems.length; i++) {
-      var itemEntity = new ItemEntity(level, x + Math.random() * 10 - 5, y + 2, z + Math.random() * 10 - 5, testItems[i]);
-      level.addFreshEntity(itemEntity);
+    // Create barrel ships with test items
+    var itemsPerBarrel = 27;
+    var barrelCount = 0;
+    var spreadRadius = 15;
+    var startIndex = 0;
+    
+    while (startIndex < testItems.length) {
+      var barrelItems = testItems.slice(startIndex, startIndex + itemsPerBarrel);
+      var barrelPos = _findSpreadPosition(level, x, y, z, barrelCount, spreadRadius);
+      _createBarrelShip(level, barrelPos.x, barrelPos.y, barrelPos.z, barrelItems, 'test_' + barrelCount);
+      
+      barrelCount++;
+      startIndex += itemsPerBarrel;
     }
     
-    logTrack('testCreateBarrelShipsAt created '+testItems.length+' test items');
+    logTrack('testCreateBarrelShipsAt created '+barrelCount+' test barrel ships with '+testItems.length+' test items');
+    
+    // Restore debug setting
+    global.Ships_CFG.DEBUG = oldDebug;
     return;
   }
   
-  logTrack('testCreateBarrelShipsAt found '+itemEntities.size()+' items, creating test barrel ships');
+  logTrack('testCreateBarrelShipsAt found '+itemEntities.size()+' dropped items');
   
-  // Use the barrel collection system
-  _createFinalBarrelCollection(level, x, y, z, 'test');
+  // Collect all existing items
+  var allItems = [];
+  var iterator = itemEntities.iterator();
+  while (iterator.hasNext()) {
+    var itemEntity = iterator.next();
+    var itemStack = itemEntity.getItem();
+    
+    if (itemStack && !itemStack.isEmpty()) {
+      allItems.push(itemStack.copy());
+      itemEntity.discard(); // Remove from world
+    }
+  }
+  
+  if (allItems.length === 0) {
+    logTrack('testCreateBarrelShipsAt no valid items collected');
+    global.Ships_CFG.DEBUG = oldDebug;
+    return;
+  }
+  
+  // Group items into barrel-sized chunks (27 items per barrel)
+  var itemsPerBarrel = 27;
+  var barrelCount = 0;
+  var spreadRadius = 15;
+  var startIndex = 0;
+  
+  while (startIndex < allItems.length) {
+    var barrelItems = allItems.slice(startIndex, startIndex + itemsPerBarrel);
+    var barrelPos = _findSpreadPosition(level, x, y, z, barrelCount, spreadRadius);
+    _createBarrelShip(level, barrelPos.x, barrelPos.y, barrelPos.z, barrelItems, 'test_' + barrelCount);
+    
+    barrelCount++;
+    startIndex += itemsPerBarrel;
+  }
+  
+  logTrack('testCreateBarrelShipsAt created '+barrelCount+' barrel ships with '+allItems.length+' total items');
+  
+  // Restore debug setting
+  global.Ships_CFG.DEBUG = oldDebug;
 }
 
-// ---------- utility functions ----------
-function Ships_broadcast(server, message) {
-  try {
-    server.tell(message);
-  } catch (e) {
-    // Fallback
-    console.log(message);
+global._shipsTrackerResolveCenter = _resolveCenter;
+
+global._shipsTrackerState = function(){ return SHIPS_TRACK; };
+
+global._createPeriodicBarrelShips = _createPeriodicBarrelShips;
+
+global._testCreateBarrelShipsAt = _testCreateBarrelShipsAt;
+
+
+var SHIPS_canSpawn = SHIPS_canSpawn || function(){
+  var keys = Object.keys(SHIPS_TRACK);
+  for (var i=0;i<keys.length;i++){
+    var st = SHIPS_TRACK[keys[i]]; 
+    if (!st || !st.level) continue;
+    
+    // Skip ships that are decaying or completed decay
+    if (st.decaying || st.decayCompleted) continue;
+    
+    var center = _resolveCenter(st);
+    var loaded = _isShipLoaded(st.level, st.ship, center.x, center.y, center.z);
+    if (loaded) return false;
   }
-}
+  return true;
+};
+
+var SHIPS_removeOldShips = SHIPS_removeOldShips || function(){
+  var keys = Object.keys(SHIPS_TRACK);
+  var removedCount=0;
+  
+  for (var i=0;i<keys.length;i++){
+    var id = keys[i];
+    var st = SHIPS_TRACK[id];
+    if (!st || !st.level) continue;
+    
+    var center = _resolveCenter(st);
+    var loaded = _isShipLoaded(st.level, st.ship, center.x, center.y, center.z);
+    
+    // Handle loaded ships: check for pirate status (decay is handled in separate loop)
+    if (loaded) {
+      dbg(st.level.server,'removeOldShips checking loaded ship '+id);
+      
+      // Only check for pirates if ship is not already decaying
+      if (!st.decaying && !st.decayCompleted) {
+        var pirateCount = _countPiratesOnShip(st.level, st.ship);
+        if (pirateCount === 0) {
+          dbg(st.level.server,'removeOldShips no pirates found on ship '+id+', starting decay');
+          _initDecay(st);
+        } else {
+          dbg(st.level.server,'removeOldShips ship '+id+' has '+pirateCount+' pirates remaining');
+        }
+      }
+      continue;
+    }
+    
+    // Handle unloaded ships: remove them
+    var ok=false; try { ok = !!KubeVS.removeShip(st.level, st.ship); } catch(_){ }
+    dbg(st.level.server,'removeOldShips unloaded ship '+id+' removed='+ok);
+    if (ok){ stopTracking(st.level.server, id); removedCount++; }
+  }
+  return removedCount;
+};
+
+global.SHIPS_canSpawn = SHIPS_canSpawn;
+global.SHIPS_removeOldShips = SHIPS_removeOldShips;
+
+// ---------- public entry: track a ship near xyz after a short settle ----------
+var SHIPS_trackAt = SHIPS_trackAt || function(level, x, y, z){
+  var server = level.server;
+
+  dbg(server, 'trackAt queued @ '+x+','+y+','+z+' (wait '+TRACK_CFG.settleTicks+'t; AABB half='+TRACK_CFG.aabb.rx+'/'+TRACK_CFG.aabb.ry+'/'+TRACK_CFG.aabb.rz+')');
+
+  schedule(server, TRACK_CFG.settleTicks, function(){
+    dbg(server, 'trackAt resolving now…');
+    var ship = resolveShipByAabb(level, x, y, z);
+    if (!ship) { dbg(server, 'no ship found via AABB at '+x+','+y+','+z); return; }
+
+    var id = 'unknown';
+    try { id = String(KubeVS.shipId(ship)); } catch(e){ }
+
+    if (SHIPS_TRACK[id]) { dbg(server, 'already tracking ship '+id); return; }
+
+    var st = { id:id, level:level, ship:ship, dead:false, anchorX:x|0, anchorY:y|0, anchorZ:z|0 };
+    try { st.slug = KubeVS.shipSlug(ship); } catch(_){ }
+    try {
+      var num = KubeVS.shipNumericId ? KubeVS.shipNumericId(ship) : null;
+      if (num === null) {
+        var objId = KubeVS.shipId(ship);
+        if (objId !== null && objId !== undefined) {
+          if (typeof objId === 'number' && isFinite(objId)) num = objId;
+          else if (typeof objId === 'string'){
+            var parsed = parseFloat(objId);
+            if (isFinite(parsed)) num = parsed;
+          }
+        }
+      }
+      if (num !== null && isFinite(num)) st.numericId = num;
+    } catch(_){ }
+
+    st.lastCenterWorld = null;
+    st.lastCenterShip = null;
+    SHIPS_TRACK[id] = st;
+
+    try {
+      var resolved = _resolveCenter(st);
+      dbg(server, 'tracking ship '+id+' center='+resolved.x.toFixed(2)+','+resolved.y.toFixed(2)+','+resolved.z.toFixed(2)+' slug='+(st.slug||'(none)'));
+      logTrack('trackAt stored world='+resolved.x+','+resolved.y+','+resolved.z+' ship='+st.lastCenterShip.x+','+st.lastCenterShip.y+','+st.lastCenterShip.z);
+    } catch (err){
+      Ships_broadcast(server, 'failed to resolve center for ship '+id+': '+err);
+      logDetail('trackAt resolve error: '+err);
+      delete SHIPS_TRACK[id];
+    }
+  });
+};
 
 // expose (Rhino-safe; no globalThis)
 global.SHIPS_trackAt  = SHIPS_trackAt;
@@ -859,7 +1870,8 @@ global.TRACK_CFG      = TRACK_CFG;
 global.TRACK_DBG      = TRACK_DBG;
 global._processBarrelCleanup = _processBarrelCleanup;
 global._cleanupAllBarrels = _cleanupAllBarrels;
-global._testCreateBarrelShipsAt = _testCreateBarrelShipsAt;
+
+// Command functionality moved to consolidated /ships command in 50_commands.js
 
 // periodic unloaded-ship pruning every ~1 minute (1200 ticks)
 ServerEvents.tick(function(event){
@@ -895,14 +1907,19 @@ ServerEvents.tick(function(event){
       // Process both main decay and sail decay
       var shouldRemove = _processDecay(st);
       
-      // Initialize sail decay for existing ships
+      // Debug: Check if sail decay is enabled (with fallback for existing ships)
       if (st.sailDecayActive === undefined) {
+        // Initialize sail decay for ships that started decaying before this feature was added
         st.sailDecayActive = true;
         st.sailDecayLastTime = 0;
+        logDetail('decay loop initializing sail decay for existing ship '+st.id);
       }
       
       if (st.sailDecayActive) {
+        logDetail('decay loop calling _processSailDecay for ship '+st.id);
         _processSailDecay(st); // Run continuous sail decay in parallel
+      } else {
+        logDetail('decay loop skipping sail decay for ship '+st.id+' (not active)');
       }
       
       if (shouldRemove) {
