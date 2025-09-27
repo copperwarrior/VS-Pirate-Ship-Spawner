@@ -2,7 +2,7 @@
 // Shared config + globals
 
 var CFG = {
-  DEBUG:                   true,
+  DEBUG:                   false,  // Debug disabled by default, enable with /ships debug on
   TICKS_BETWEEN_TRIES:     120 * 60 * 20, // 144000 (every ~120 minutes)
   TRIES_PER_PLAYER:        6,
   MIN_RADIUS:              96,
@@ -14,7 +14,22 @@ var CFG = {
   MIN_WATER_DEPTH:         4,
   WATER_PAD_RADIUS:        2,
   Y_SCAN_TOP:              128,
-  Y_SCAN_BOTTOM:           0
+  Y_SCAN_BOTTOM:           0,
+  
+  // Decay system configuration
+  DECAY_START_TICKS:       60,     // Initial delay between chunks (3 seconds)
+  DECAY_END_TICKS:         5,     // Final delay between chunks (1.0 seconds)
+  DECAY_ACCELERATION:      50,     // How many chunks to reach max speed
+  DECAY_DEFAULT_BOUNDS:    50,     // Default ship bounds when AABB unavailable
+  DECAY_DEFAULT_HEIGHT:    20,     // Default ship height when AABB unavailable
+  
+  // Floodfill decay limits
+  DECAY_FLOODFILL_START:   15,     // Starting floodfill size for main decay (blocks)
+  DECAY_FLOODFILL_END:     75,     // Ending floodfill size for main decay (blocks)
+  SAIL_FLOODFILL_SIZE:     47,     // Fixed floodfill size for sail decay (blocks)
+  
+  // Barrel cleanup
+  BARREL_DESPAWN_MINUTES:  30      // Minutes before barrels despawn (0 = never despawn)
 };
 
 var tickCounter = 0;
