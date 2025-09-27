@@ -1,3 +1,5 @@
+// priority: 3
+
 // ships/55_debug.js
 // Debug functionality moved to consolidated /ships command in 50_commands.js
 

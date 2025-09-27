@@ -1,3 +1,5 @@
+// priority: 2
+
 // ships/60_ticker.js
 // Minimal tick-queue so other scripts can schedule delayed callbacks
 

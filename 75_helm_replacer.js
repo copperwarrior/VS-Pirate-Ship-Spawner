@@ -1,4 +1,6 @@
-// kubejs/server_scripts/ships/75_helm_replacer.js
+// priority: 0
+
+// // kubejs/server_scripts/ships/75_helm_replacer.js
 // When a ship starts being tracked successfully, search for vs_sails:helm_block,
 // break it, then replace it after 1 second with proper neighbor updates
 

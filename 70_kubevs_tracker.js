@@ -1,3 +1,5 @@
+// priority: 1
+
 // kubejs/server_scripts/ships/70_kubevs_tracker.js
 // Valkyrien Skies ship tracker – resolve via AABB, keep centers fresh, prune unloaded ships
 
@@ -893,9 +895,6 @@ function _makeBlockFallShipSpace(level, shipSpaceX, shipSpaceY, shipSpaceZ, ship
     var fallingBlock = FallingBlockEntity.fall(level, shipPos, blockState);
     
     if (fallingBlock) {
-      // Fix UUID collisions by generating a fresh UUID
-      var UUID = Java.loadClass('java.util.UUID');
-      fallingBlock.setUUID(UUID.randomUUID());
       // Add some randomness to prevent UUID collisions and make it look more natural
       var randomOffsetX = Math.random() * 0.6 - 0.3; // Random between -0.3 and 0.3
       var randomOffsetZ = Math.random() * 0.6 - 0.3;

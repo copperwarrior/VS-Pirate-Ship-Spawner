@@ -1,3 +1,5 @@
+// priority: 4
+
 // ships/50_commands.js
 // Consolidated /ships command system
 

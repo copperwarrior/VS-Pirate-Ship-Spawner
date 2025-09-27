@@ -1,3 +1,5 @@
+// priority: 6
+
 // KubeVS bridge (no-reflection, KubeJS 2001 / Forge 1.20.1)
 // Exposes minimal API used by tracker:
 //   - shipsInAABB(level, mcAABB)
@@ -21,7 +23,7 @@ global = global || this; // Rhino: ensure we have a global object
 (function initKubeVSBridge () {
   var TAG = '[KubeVS Bridge]';
   try {
-    var VSGameUtilsKt = Java.loadClass('org.valkyrienskies.mod.common.VSGameUtilsKt');
+    var VSGameUtilsKt = null; try { VSGameUtilsKt = Java.loadClass('org.valkyrienskies.mod.common.VSGameUtilsKt'); } catch(_1){}
     var ShipAssemblyKt = Java.loadClass('org.valkyrienskies.mod.common.assembly.ShipAssemblyKt');
     var AABBd          = Java.loadClass('org.joml.primitives.AABBd');
     var AABBdc         = Java.loadClass('org.joml.primitives.AABBdc');
@@ -41,11 +43,11 @@ global = global || this; // Rhino: ensure we have a global object
       return function(){};
     })();
 
-    if (!VSGameUtilsKt || !AABBd || !Vector3d) {
-      logFn('Required bindings missing (VSGameUtilsKt/AABBd/Vector3d).');
+    if (!AABBd || !Vector3d) {
+      logFn('Required bindings missing (AABBd/Vector3d).');
       global.KubeVS = {
         shipsInAABB: function () {
-          throw new Error('shipsInAABB unavailable: bindings missing (VSGameUtilsKt/AABBd/Vector3d).');
+          throw new Error('shipsInAABB unavailable: bindings missing (AABBd/Vector3d).');
         }
       };
       return;
@@ -127,7 +129,7 @@ global = global || this; // Rhino: ensure we have a global object
 
       shipsInAABB: function (level, mcAABB) {
         if (!level || !mcAABB) throw new Error('shipsInAABB: bad args');
-        logFn('shipsInAABB request box='+mcAABB);
+        logFn('shipsInAABB request box='+mcAABB+' using getAllShips+center-filter');
         
         // Inline helper functions to avoid closure issues
         function inlineIterableToArray(list){
@@ -151,29 +153,32 @@ global = global || this; // Rhino: ensure we have a global object
                            mcAABB.maxX, mcAABB.maxY, mcAABB.maxZ);
         }
         
-        // Use VSGameUtilsKt.getShipsIntersecting directly
-        try {
-          logFn('shipsInAABB trying VSGameUtilsKt.getShipsIntersecting with mcAABB');
-          var res = VSGameUtilsKt.getShipsIntersecting(level, mcAABB);
-          var arr = inlineIterableToArray(res);
-          logFn('shipsInAABB direct VSGameUtilsKt found '+(arr?arr.length:0));
-          return arr || [];
-        } catch(err1){ 
-          logFn('shipsInAABB direct failed: '+err1);
-          
-          // Try with AABBd conversion
+        // New single method: getAllShips + center filter (no fallbacks)
+        var world = null;
+        if (level.serverShipObjectWorld) world = level.serverShipObjectWorld;
+        else if (level.shipObjectWorld) world = level.shipObjectWorld;
+        else if (level.server && level.server.serverShipObjectWorld) world = level.server.serverShipObjectWorld;
+        if (!world) throw new Error('shipsInAABB unavailable: Ship world attachment missing on level');
+        if (typeof world.getAllShips !== 'function') throw new Error('shipsInAABB unavailable: ship world missing getAllShips');
+
+        var all = inlineIterableToArray(world.getAllShips());
+        var cx = (mcAABB.minX + mcAABB.maxX) / 2.0;
+        var cy = (mcAABB.minY + mcAABB.maxY) / 2.0;
+        var cz = (mcAABB.minZ + mcAABB.maxZ) / 2.0;
+        var rx = Math.abs(mcAABB.maxX - mcAABB.minX) / 2.0 + 8.0;
+        var ry = Math.abs(mcAABB.maxY - mcAABB.minY) / 2.0 + 8.0;
+        var rz = Math.abs(mcAABB.maxZ - mcAABB.minZ) / 2.0 + 8.0;
+        var filtered = [];
+        for (var i = 0; i < all.length; i++) {
+          var s = all[i];
           try {
-            logFn('shipsInAABB trying VSGameUtilsKt.getShipsIntersecting with AABBd');
-            var aabbD = inlineToAABBd(mcAABB);
-            var res2 = VSGameUtilsKt.getShipsIntersecting(level, aabbD);
-            var arr2 = inlineIterableToArray(res2);
-            logFn('shipsInAABB AABBd VSGameUtilsKt found '+(arr2?arr2.length:0));
-            return arr2 || [];
-          } catch(err2){
-            logFn('shipsInAABB AABBd failed: '+err2);
-            throw new Error('shipsInAABB all methods failed: '+err1+' / '+err2);
-          }
+            var sc = api.shipCenterWorld(s);
+            if (!sc) continue;
+            if (Math.abs(sc.x - cx) <= rx && Math.abs(sc.y - cy) <= ry && Math.abs(sc.z - cz) <= rz) filtered.push(s);
+          } catch(_fc){}
         }
+        logFn('shipsInAABB center-filter -> '+filtered.length+' of '+(all?all.length:0));
+        return filtered;
       },
 
       shipId: function(ship){

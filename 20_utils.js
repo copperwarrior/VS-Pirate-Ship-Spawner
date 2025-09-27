@@ -1,3 +1,5 @@
+// priority: 7
+
 // ships/20_utils.js
 // Helper utilities (Rhino-friendly)
 

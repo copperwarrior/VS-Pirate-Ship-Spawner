@@ -1,3 +1,5 @@
+// priority: 5
+
 // ships/40_spawner.js
 // Spawner + tick driver
 

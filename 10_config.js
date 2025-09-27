@@ -1,3 +1,5 @@
+// priority: 8
+
 // ships/10_config.js
 // Shared config + globals
 
